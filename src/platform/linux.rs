@@ -116,8 +116,9 @@ mod tests {
     #[test]
     fn self_pid_produces_a_snapshot() {
         let mut sampler = LinuxSampler::new();
-        let snaps = sampler.sample_tree(std::process::id() as i32);
-        let me = snaps.iter().find(|s| s.pid == std::process::id() as i32).expect("self snapshot");
+        let pid = std::process::id().cast_signed();
+        let snaps = sampler.sample_tree(pid);
+        let me = snaps.iter().find(|s| s.pid == pid).expect("self snapshot");
         assert!(me.rss_bytes > 0, "expected non-zero RSS");
         assert!(me.vms_bytes > 0, "expected non-zero VMS");
     }
