@@ -1,0 +1,52 @@
+[package]
+name = "tricord"
+version = "0.1.0"
+authors = ["Nils Homer <nils@fulcrumgenomics.com>"]
+description = "Run a command and report its process tree's CPU, memory, and I/O usage"
+repository = "https://github.com/fg-labs/tricord"
+homepage = "https://github.com/fg-labs/tricord"
+license = "MIT"
+edition = "2024"
+rust-version = "1.94.0"
+readme = "README.md"
+keywords = ["benchmark", "process-tree", "resource-usage", "monitoring", "snakemake"]
+categories = ["command-line-utilities", "development-tools::profiling"]
+
+[package.metadata.docs.rs]
+# Build docs for both supported platforms so macOS-only and Linux-only
+# items both render on docs.rs.
+targets = ["x86_64-unknown-linux-gnu", "x86_64-apple-darwin"]
+
+[lib]
+name = "tricord"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tricorder"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive", "wrap_help", "unicode"] }
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+signal-hook = "0.3"
+libc = "0.2"
+log = "0"
+env_logger = "0.11"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+procfs = { version = "0.17", default-features = false }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libproc = "0.14"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+overflow-checks = true
+panic = "abort"

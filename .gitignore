@@ -1,0 +1,17 @@
+# Build
+/target
+**/*.rs.bk
+*.pdb
+
+# File system
+.DS_Store
+desktop.ini
+
+# Editor
+*.swp
+*.swo
+Session.vim
+.idea
+*.iml
+.vscode
+.claude

@@ -1,0 +1,113 @@
+name: Manage Release PRs and Publish Crates
+
+permissions:
+  pull-requests: write
+  contents: write
+
+on:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: release-plz-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-pr:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate app token
+        id: app-token
+        uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859 # v3.0.0
+        with:
+          app-id: ${{ secrets.FG_LABS_BOT_APP_ID }}
+          private-key: ${{ secrets.FG_LABS_BOT_PRIVATE_KEY }}
+      - name: Checkout code
+        uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+        with:
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - name: Create or update release PR
+        uses: release-plz/action@1528104d2ca23787631a1c1f022abb64b34c1e11 # v0.5.128
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: write
+    steps:
+      - name: Generate app token
+        id: app-token
+        uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859 # v3.0.0
+        with:
+          app-id: ${{ secrets.FG_LABS_BOT_APP_ID }}
+          private-key: ${{ secrets.FG_LABS_BOT_PRIVATE_KEY }}
+      - name: Checkout code
+        uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+        with:
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - name: Authenticate to crates.io via Trusted Publishing
+        id: crates-auth
+        uses: rust-lang/crates-io-auth-action@bbd81622f20ce9e2dd9622e3218b975523e45bbe # v1.0.4
+      - name: Publish crate
+        id: publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-auth.outputs.token }}
+        run: |
+          set -euo pipefail
+
+          VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r \
+            '.packages[] | select(.name == "tricord") | .version')
+
+          PUBLISHED_VERSION=$(curl -sS \
+            -H "User-Agent: tricord-ci (https://github.com/fg-labs/tricord)" \
+            "https://crates.io/api/v1/crates/tricord" | jq -r \
+            '.crate.max_version // "0.0.0"')
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+          if [ "$VERSION" = "$PUBLISHED_VERSION" ]; then
+            echo "tricord v$VERSION already on crates.io -- nothing to publish"
+            echo "published=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Publishing tricord v$VERSION..."
+          cargo publish -p tricord
+          echo "Published tricord v$VERSION"
+          echo "published=true" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub release
+        if: steps.publish.outputs.version != ''
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.publish.outputs.version }}"
+          TAG="v${VERSION}"
+
+          # Idempotent: skip if tag/release already exist
+          if ! git rev-parse "$TAG" >/dev/null 2>&1; then
+            git tag "$TAG"
+          fi
+          if ! git ls-remote --tags origin "$TAG" | grep -q "$TAG"; then
+            git push origin "$TAG"
+          fi
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --title "v${VERSION}" \
+              --generate-notes \
+              --latest
+          else
+            echo "Release $TAG already exists -- skipping"
+          fi
