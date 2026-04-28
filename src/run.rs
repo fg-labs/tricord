@@ -45,6 +45,8 @@ pub struct RunOptions {
     /// If true, write a one-line summary to stderr after the child exits.
     /// If false but stderr is a terminal, still print the summary.
     pub force_summary: bool,
+    /// Optional path for a per-tick TSV trace. `None` disables the trace.
+    pub trace_path: Option<Box<Path>>,
 }
 
 /// Spawn `command` (with `args`), benchmark its process tree, and write the
@@ -73,7 +75,10 @@ pub fn run_command(command: &str, args: &[String], options: &RunOptions) -> io::
     // Install signal forwarding before the sampler so a fast Ctrl-C still
     // reaches the child even if the sampler thread hasn't started yet.
     let signals = SignalForwarder::install(child_pid)?;
-    let sampler = SamplerHandle::spawn(child_pid, SamplerOptions { interval: options.interval });
+    let sampler = SamplerHandle::spawn(
+        child_pid,
+        SamplerOptions { interval: options.interval, trace_path: options.trace_path.clone() },
+    );
 
     let status = child.wait()?;
     let record = sampler.stop();

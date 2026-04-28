@@ -169,6 +169,7 @@ let options = RunOptions {
     output_path: std::path::Path::new("/tmp/timing.tsv").into(),
     format: OutputFormat::Tsv,
     force_summary: false,
+    trace_path: None,
 };
 let outcome = run_command("samtools", &["sort".into(), "in.bam".into()], &options).unwrap();
 println!("exit={} cpu_time={:.2}s", outcome.exit_code(), outcome.record.cpu_time);
