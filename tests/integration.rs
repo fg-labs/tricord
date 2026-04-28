@@ -13,7 +13,14 @@ fn binary() -> PathBuf {
 }
 
 fn run_bench(out: &std::path::Path, format: &str, command: &[&str]) -> std::process::Output {
+    // Tighten the sampling interval well below the default 0.5 s so a sub-
+    // second workload still yields multiple samples even on a heavily-loaded
+    // CI runner. Without this, `sleep 0.6` could land in a single 0.5 s
+    // window that the sampler thread misses if it's late waking up — which
+    // is what caused `json_output_round_trips_to_object` to flake on
+    // macos-latest.
     let mut cmd = Command::new(binary());
+    cmd.args(["--interval", "0.1"]);
     cmd.arg("--out").arg(out).arg("--format").arg(format).arg("--");
     for piece in command {
         cmd.arg(piece);
