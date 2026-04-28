@@ -96,7 +96,7 @@ fn instant_exit_yields_na_row() {
 }
 
 fn python3_available() -> bool {
-    Command::new("python3").arg("--version").output().map(|o| o.status.success()).unwrap_or(false)
+    Command::new("python3").arg("--version").output().is_ok_and(|o| o.status.success())
 }
 
 /// End-to-end check that the platform sampler observes resource usage
