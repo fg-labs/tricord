@@ -18,9 +18,9 @@ both spreadsheets and pipelines.
 <p>
 <a href="https://fulcrumgenomics.com">
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset=".github/logos/fulcrumgenomics-dark.svg">
-  <source media="(prefers-color-scheme: light)" srcset=".github/logos/fulcrumgenomics-light.svg">
-  <img alt="Fulcrum Genomics" src=".github/logos/fulcrumgenomics-light.svg" height="100">
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/fg-labs/tricord/main/.github/logos/fulcrumgenomics-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/fg-labs/tricord/main/.github/logos/fulcrumgenomics-light.svg">
+  <img alt="Fulcrum Genomics" src="https://raw.githubusercontent.com/fg-labs/tricord/main/.github/logos/fulcrumgenomics-light.svg" height="100">
 </picture>
 </a>
 </p>
