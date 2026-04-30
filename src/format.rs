@@ -38,14 +38,26 @@ pub fn write_to_path(
     path: &Path,
     format: OutputFormat,
 ) -> io::Result<()> {
+    ensure_parent_dir(path)?;
+    let file = File::create(path)?;
+    let mut writer = BufWriter::new(file);
+    write_to(record, &mut writer, format)?;
+    // Surface flush errors instead of letting BufWriter::drop swallow them.
+    writer.flush()
+}
+
+/// Create the parent directory of `path` if it has one and isn't empty.
+/// Used by both the aggregate output writer and the trace writer.
+///
+/// # Errors
+/// Returns any I/O error from `create_dir_all`.
+pub(crate) fn ensure_parent_dir(path: &Path) -> io::Result<()> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
         std::fs::create_dir_all(parent)?;
     }
-    let file = File::create(path)?;
-    let mut writer = BufWriter::new(file);
-    write_to(record, &mut writer, format)
+    Ok(())
 }
 
 /// Serialize `record` into the given writer.

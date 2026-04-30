@@ -11,6 +11,58 @@ use serde::Serialize;
 pub const TSV_HEADER: &str =
     "s\th:m:s\tmax_rss\tmax_vms\tmax_uss\tmax_pss\tio_in\tio_out\tmean_load\tcpu_time";
 
+/// Tab-separated header for the per-tick trace TSV (`--trace`). Distinct from
+/// [`TSV_HEADER`] because the trace records *instantaneous* memory and
+/// *cumulative-so-far* I/O and CPU values; there is no `mean_load` or `h:m:s`
+/// column because those are only meaningful for the whole-run aggregate.
+pub const TRACE_TSV_HEADER: &str = "s\trss\tvms\tuss\tpss\tio_in\tio_out\tcpu_time\tn_procs";
+
+/// One per-tick row of the trace TSV.
+///
+/// Memory fields (`rss`, `vms`, `uss`, `pss`) are summed across the *currently-
+/// live* process tree at that tick, in MiB. I/O and CPU fields are the running
+/// per-PID accumulators summed across *every* PID observed so far (including
+/// children that have already exited), so the values are monotonically
+/// non-decreasing across rows.
+#[derive(Debug, Clone, Default)]
+pub struct TickRecord {
+    /// Seconds since the sampler started.
+    pub elapsed: f64,
+    /// Summed RSS across live processes, MiB.
+    pub rss: f64,
+    /// Summed VMS across live processes, MiB.
+    pub vms: f64,
+    /// Summed USS across live processes, MiB. `None` if no process exposed it.
+    pub uss: Option<f64>,
+    /// Summed PSS across live processes, MiB. `None` if no process exposed it.
+    pub pss: Option<f64>,
+    /// Cumulative bytes read across observed PIDs, MiB. `None` if never seen.
+    pub io_in: Option<f64>,
+    /// Cumulative bytes written across observed PIDs, MiB. `None` if never seen.
+    pub io_out: Option<f64>,
+    /// Cumulative user + system CPU time across observed PIDs, seconds.
+    pub cpu_time: f64,
+    /// Number of live processes in this tick.
+    pub n_procs: usize,
+}
+
+impl TickRecord {
+    /// Render this tick as a single TSV row using `%.4f` for elapsed time,
+    /// `%.2f` for floats, `-` for missing optional values, and a bare integer
+    /// for `n_procs`.
+    #[must_use]
+    pub fn to_tsv_row(&self) -> String {
+        let mut out = String::with_capacity(96);
+        write!(out, "{:.4}\t{:.2}\t{:.2}", self.elapsed, self.rss, self.vms).unwrap();
+        for value in [self.uss, self.pss, self.io_in, self.io_out] {
+            out.push('\t');
+            out.push_str(&format_optional_float(value));
+        }
+        write!(out, "\t{:.2}\t{}", self.cpu_time, self.n_procs).unwrap();
+        out
+    }
+}
+
 /// One row of benchmark output: the aggregate of all samples taken across the run.
 ///
 /// Memory values are in MiB. `io_in` and `io_out` are in MiB. `running_time` and
@@ -232,6 +284,43 @@ mod tests {
         assert!(lines.next().is_some_and(|line| line.starts_with("0.5000\t")));
         assert_eq!(lines.next(), None);
         assert!(doc.ends_with('\n'));
+    }
+
+    #[test]
+    fn trace_header_lists_per_tick_columns() {
+        assert_eq!(TRACE_TSV_HEADER, "s\trss\tvms\tuss\tpss\tio_in\tio_out\tcpu_time\tn_procs");
+    }
+
+    #[test]
+    fn tick_row_full_data() {
+        let tick = TickRecord {
+            elapsed: 0.5012,
+            rss: 102.30,
+            vms: 2048.0,
+            uss: Some(95.2),
+            pss: Some(96.0),
+            io_in: Some(1.25),
+            io_out: Some(0.5),
+            cpu_time: 0.75,
+            n_procs: 3,
+        };
+        assert_eq!(tick.to_tsv_row(), "0.5012\t102.30\t2048.00\t95.20\t96.00\t1.25\t0.50\t0.75\t3");
+    }
+
+    #[test]
+    fn tick_row_missing_optionals_render_as_dash() {
+        let tick = TickRecord {
+            elapsed: 1.0,
+            rss: 10.0,
+            vms: 20.0,
+            uss: None,
+            pss: None,
+            io_in: None,
+            io_out: None,
+            cpu_time: 0.0,
+            n_procs: 1,
+        };
+        assert_eq!(tick.to_tsv_row(), "1.0000\t10.00\t20.00\t-\t-\t-\t-\t0.00\t1");
     }
 
     #[test]

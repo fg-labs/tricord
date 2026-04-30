@@ -34,6 +34,9 @@ both spreadsheets and pipelines.
 - **Two output formats** — Snakemake-compatible TSV by default, one-line
   JSON (`--format json`) for programmatic consumers.
 - **Optional one-line summary** to stderr (`--summary`).
+- **Optional per-tick trace** (`--trace <PATH>`) — one TSV row per sample, so
+  you can see how memory, I/O, and CPU evolved during the run instead of just
+  the final aggregate.
 - **Clean shutdown** — forwards `SIGINT` / `SIGTERM` / `SIGHUP` to the
   child's process group so orchestrators can tear runs down without
   leaking children.
@@ -72,6 +75,7 @@ Options:
       --format <FORMAT>      tsv | json [default: tsv]
       --interval <SECONDS>   Sampling interval [default: 0.5]
       --summary              Print one-line summary to stderr after the run
+      --trace <PATH>         Also write a per-tick TSV trace to this path
   -v, --verbose...           Increase log level (-v, -vv, -vvv)
   -h, --help                 Print help
   -V, --version              Print version
@@ -105,6 +109,30 @@ s	h:m:s	max_rss	max_vms	max_uss	max_pss	io_in	io_out	mean_load	cpu_time
 
 Missing values render as `-`; if the run was too short for any sample to
 succeed, every resource column is `NA`.
+
+### Per-tick trace (`--trace <PATH>`)
+
+When `--trace` is given, `tricorder` also writes a separate TSV with one row
+per sampling tick — useful for "did it spike or stay flat?" plots and for
+post-mortem on OOM kills. The aggregate `--out` file is unaffected.
+
+```text
+s	rss	vms	uss	pss	io_in	io_out	cpu_time	n_procs
+0.5012	102.30	2048.00	95.20	96.00	1.25	0.50	0.75	3
+1.0027	120.45	2048.00	112.10	113.00	2.50	1.00	1.55	3
+1.5042	101.50	2048.00	95.20	96.00	2.50	1.00	2.40	2
+```
+
+| Column | Units | Meaning |
+|---|---|---|
+| `s` | seconds (`%.4f`) | Time since `tricorder` started |
+| `rss`, `vms`, `uss`, `pss` | MiB (`%.2f`) | **Instantaneous** sum across the live process tree at this tick |
+| `io_in`, `io_out` | MiB | **Cumulative** bytes read/written across every PID observed so far (including exited children) |
+| `cpu_time` | seconds | Cumulative user + system CPU time across observed PIDs |
+| `n_procs` | integer | Number of live processes in this tick |
+
+Memory columns are instantaneous, so they can go up *or down* between rows;
+I/O and CPU are cumulative, so they are monotonically non-decreasing.
 
 ### JSON (`--format json`)
 
@@ -169,6 +197,7 @@ let options = RunOptions {
     output_path: std::path::Path::new("/tmp/timing.tsv").into(),
     format: OutputFormat::Tsv,
     force_summary: false,
+    trace_path: None,
 };
 let outcome = run_command("samtools", &["sort".into(), "in.bam".into()], &options).unwrap();
 println!("exit={} cpu_time={:.2}s", outcome.exit_code(), outcome.record.cpu_time);

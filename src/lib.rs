@@ -23,6 +23,7 @@
 //!     output_path: std::path::Path::new("/tmp/timing.tsv").into(),
 //!     format: OutputFormat::Tsv,
 //!     force_summary: false,
+//!     trace_path: None,
 //! };
 //! let outcome = run_command("echo", &["hello".to_string()], &options).unwrap();
 //! assert_eq!(outcome.exit_code(), 0);

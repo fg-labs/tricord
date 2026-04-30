@@ -12,16 +12,26 @@ fn binary() -> PathBuf {
     path.join("tricorder")
 }
 
-fn run_bench(out: &std::path::Path, format: &str, command: &[&str]) -> std::process::Output {
+fn run_bench(
+    out: &std::path::Path,
+    format: &str,
+    extra_args: &[&str],
+    command: &[&str],
+) -> std::process::Output {
     // Tighten the sampling interval well below the default 0.5 s so a sub-
     // second workload still yields multiple samples even on a heavily-loaded
     // CI runner. Without this, `sleep 0.6` could land in a single 0.5 s
     // window that the sampler thread misses if it's late waking up — which
     // is what caused `json_output_round_trips_to_object` to flake on
-    // macos-latest.
+    // macos-latest. Callers can override via `extra_args` (clap takes the
+    // last value).
     let mut cmd = Command::new(binary());
     cmd.args(["--interval", "0.1"]);
-    cmd.arg("--out").arg(out).arg("--format").arg(format).arg("--");
+    cmd.arg("--out").arg(out).arg("--format").arg(format);
+    for arg in extra_args {
+        cmd.arg(arg);
+    }
+    cmd.arg("--");
     for piece in command {
         cmd.arg(piece);
     }
@@ -32,7 +42,7 @@ fn run_bench(out: &std::path::Path, format: &str, command: &[&str]) -> std::proc
 fn tsv_output_for_short_lived_command_has_correct_shape() {
     let tmp = tempfile::tempdir().unwrap();
     let out = tmp.path().join("timing.tsv");
-    let result = run_bench(&out, "tsv", &["sh", "-c", "sleep 0.7"]);
+    let result = run_bench(&out, "tsv", &[], &["sh", "-c", "sleep 0.7"]);
     assert!(result.status.success(), "stderr: {}", String::from_utf8_lossy(&result.stderr));
 
     let text = std::fs::read_to_string(&out).expect("read tsv");
@@ -55,7 +65,7 @@ fn tsv_output_for_short_lived_command_has_correct_shape() {
 fn json_output_round_trips_to_object() {
     let tmp = tempfile::tempdir().unwrap();
     let out = tmp.path().join("timing.json");
-    let result = run_bench(&out, "json", &["sh", "-c", "sleep 0.6"]);
+    let result = run_bench(&out, "json", &[], &["sh", "-c", "sleep 0.6"]);
     assert!(result.status.success());
 
     let text = std::fs::read_to_string(&out).unwrap();
@@ -69,7 +79,7 @@ fn json_output_round_trips_to_object() {
 fn nested_output_directory_is_created() {
     let tmp = tempfile::tempdir().unwrap();
     let out = tmp.path().join("does/not/exist/yet/timing.tsv");
-    let result = run_bench(&out, "tsv", &["sh", "-c", "true"]);
+    let result = run_bench(&out, "tsv", &[], &["sh", "-c", "true"]);
     assert!(result.status.success());
     assert!(out.exists());
 }
@@ -78,7 +88,7 @@ fn nested_output_directory_is_created() {
 fn exit_code_is_passed_through() {
     let tmp = tempfile::tempdir().unwrap();
     let out = tmp.path().join("timing.tsv");
-    let result = run_bench(&out, "tsv", &["sh", "-c", "exit 42"]);
+    let result = run_bench(&out, "tsv", &[], &["sh", "-c", "exit 42"]);
     assert_eq!(result.status.code(), Some(42));
     // The benchmark file should still exist even when the child failed.
     assert!(out.exists());
@@ -88,7 +98,7 @@ fn exit_code_is_passed_through() {
 fn instant_exit_yields_na_row() {
     let tmp = tempfile::tempdir().unwrap();
     let out = tmp.path().join("timing.tsv");
-    let result = run_bench(&out, "tsv", &["sh", "-c", "true"]);
+    let result = run_bench(&out, "tsv", &[], &["sh", "-c", "true"]);
     assert!(result.status.success());
 
     let text = std::fs::read_to_string(&out).unwrap();
@@ -100,6 +110,54 @@ fn instant_exit_yields_na_row() {
     assert_eq!(cols.len(), 10);
     let wall: f64 = cols[0].parse().expect("wall time parses");
     assert!(wall >= 0.0);
+}
+
+#[test]
+fn trace_flag_writes_per_tick_tsv() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("timing.tsv");
+    let trace = tmp.path().join("trace.tsv");
+    let trace_str = trace.to_str().expect("utf8 trace path");
+
+    let result = run_bench(&out, "tsv", &["--trace", trace_str], &["sh", "-c", "sleep 0.6"]);
+    assert!(result.status.success(), "stderr: {}", String::from_utf8_lossy(&result.stderr));
+
+    // Aggregate file is unaffected by --trace.
+    let agg = std::fs::read_to_string(&out).expect("aggregate tsv");
+    assert_eq!(agg.lines().count(), 2, "aggregate should still be header + 1 row");
+
+    let trace_text = std::fs::read_to_string(&trace).expect("trace tsv");
+    let lines: Vec<&str> = trace_text.lines().collect();
+    assert_eq!(
+        lines[0], "s\trss\tvms\tuss\tpss\tio_in\tio_out\tcpu_time\tn_procs",
+        "unexpected trace header"
+    );
+    assert!(
+        lines.len() >= 3,
+        "expected header + multiple ticks, got {}: {trace_text:?}",
+        lines.len()
+    );
+
+    let mut last_elapsed = -1.0_f64;
+    for row in &lines[1..] {
+        let cols: Vec<&str> = row.split('\t').collect();
+        assert_eq!(cols.len(), 9, "row has wrong column count: {row:?}");
+        let elapsed: f64 = cols[0].parse().expect("elapsed parses");
+        assert!(elapsed >= last_elapsed, "elapsed should be monotonic");
+        last_elapsed = elapsed;
+    }
+}
+
+#[test]
+fn trace_parent_directory_is_created() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("timing.tsv");
+    let trace = tmp.path().join("nested/dir/trace.tsv");
+    let trace_str = trace.to_str().expect("utf8 trace path");
+
+    let result = run_bench(&out, "tsv", &["--trace", trace_str], &["sh", "-c", "sleep 0.3"]);
+    assert!(result.status.success(), "stderr: {}", String::from_utf8_lossy(&result.stderr));
+    assert!(trace.exists(), "trace file should be created in nested directory");
 }
 
 fn python3_available() -> bool {
@@ -155,17 +213,7 @@ while time.monotonic() < end:
         scratch = scratch.display().to_string(),
     );
 
-    // Tighten the sampling interval so a ~2 s workload still yields a
-    // dozen-plus samples even if the first poll lands late.
-    let result = Command::new(binary())
-        .arg("--out")
-        .arg(&out)
-        .args(["--interval", "0.1"])
-        .args(["--format", "tsv"])
-        .arg("--")
-        .args(["python3", "-c", &workload])
-        .output()
-        .expect("spawn tricorder");
+    let result = run_bench(&out, "tsv", &[], &["python3", "-c", &workload]);
     assert!(result.status.success(), "stderr: {}", String::from_utf8_lossy(&result.stderr));
 
     let text = std::fs::read_to_string(&out).expect("read tsv");

@@ -36,6 +36,12 @@ pub struct Args {
     #[arg(long)]
     pub summary: bool,
 
+    /// Optional path for a per-tick TSV trace. When set, `tricorder` writes
+    /// one row per sample showing instantaneous memory and cumulative I/O
+    /// and CPU, alongside the aggregate `--out` file.
+    #[arg(long, value_name = "PATH")]
+    pub trace: Option<PathBuf>,
+
     /// Verbosity (each `-v` raises the log level: warn → info → debug → trace).
     #[arg(short, long, action = clap::ArgAction::Count)]
     pub verbose: u8,
@@ -129,6 +135,26 @@ mod tests {
         let args =
             Args::parse_from(["tricorder", "--out", "x", "--interval", "1.25", "--", "true"]);
         assert_eq!(args.interval_duration(), Duration::from_millis(1250));
+    }
+
+    #[test]
+    fn parses_trace_path() {
+        let args = Args::parse_from([
+            "tricorder",
+            "--out",
+            "out.tsv",
+            "--trace",
+            "/tmp/trace.tsv",
+            "--",
+            "true",
+        ]);
+        assert_eq!(args.trace, Some(PathBuf::from("/tmp/trace.tsv")));
+    }
+
+    #[test]
+    fn trace_defaults_to_none() {
+        let args = Args::parse_from(["tricorder", "--out", "out.tsv", "--", "true"]);
+        assert!(args.trace.is_none());
     }
 
     #[test]

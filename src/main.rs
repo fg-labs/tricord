@@ -1,6 +1,6 @@
 //! Entry point for the `tricorder` binary.
 
-use std::process::ExitCode;
+use std::{path::PathBuf, process::ExitCode};
 
 use clap::Parser;
 use tricord::{
@@ -25,6 +25,7 @@ fn main() -> ExitCode {
         output_path: args.out.clone().into_boxed_path(),
         format: args.format.into(),
         force_summary: args.summary,
+        trace_path: args.trace.clone().map(PathBuf::into_boxed_path),
     };
 
     match run_command(&command, &command_args, &options) {
