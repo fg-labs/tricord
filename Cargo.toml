@@ -1,6 +1,6 @@
 [package]
 name = "tricord"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Nils Homer <nils@fulcrumgenomics.com>"]
 description = "Run a command and report its process tree's CPU, memory, and I/O usage"
 repository = "https://github.com/fg-labs/tricord"
