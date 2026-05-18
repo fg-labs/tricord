@@ -48,16 +48,19 @@ fn tsv_output_for_short_lived_command_has_correct_shape() {
     let text = std::fs::read_to_string(&out).expect("read tsv");
     let lines: Vec<&str> = text.lines().collect();
     assert_eq!(lines.len(), 2, "expected header + 1 data row, got: {text:?}");
-    // Default mode (no --snakemake): full schema, 10 Snakemake columns +
-    // 2 tricord-appended columns (page faults).
-    assert_eq!(
-        lines[0],
-        "s\th:m:s\tmax_rss\tmax_vms\tmax_uss\tmax_pss\tio_in\tio_out\tmean_load\tcpu_time\t\
-         major_page_faults\tminor_page_faults",
-    );
-
+    // Default mode (no --snakemake): full schema, 10 Snakemake columns
+    // followed by every tricord-added column (page faults, ctx switches, …).
+    // The expected column count is derived from the header so future
+    // metric PRs only need to update the expected header string, not also
+    // the column count.
+    let expected_cols = lines[0].split('\t').count();
     let cols: Vec<&str> = lines[1].split('\t').collect();
-    assert_eq!(cols.len(), 12);
+    assert_eq!(cols.len(), expected_cols);
+    assert!(lines[0].starts_with(
+        "s\th:m:s\tmax_rss\tmax_vms\tmax_uss\tmax_pss\tio_in\tio_out\tmean_load\tcpu_time",
+    ));
+    assert!(lines[0].contains("\tmajor_page_faults\tminor_page_faults"));
+    assert!(lines[0].contains("\tvoluntary_ctx_switches\tinvoluntary_ctx_switches"));
     let wall: f64 = cols[0].parse().expect("wall time parses");
     assert!(wall >= 0.5, "wall time {wall} should be at least 0.5s");
     assert!(wall < 5.0, "wall time {wall} should be under 5s");
@@ -109,8 +112,9 @@ fn instant_exit_yields_na_row() {
     let cols: Vec<&str> = row.split('\t').collect();
     // Either we caught a sample (numbers) or we didn't (NA placeholders);
     // both are valid for an essentially-instant child. Just verify the row
-    // is well-formed against the full-mode schema (12 columns).
-    assert_eq!(cols.len(), 12);
+    // is well-formed and matches the header's column count.
+    let header_cols = text.lines().next().expect("header").split('\t').count();
+    assert_eq!(cols.len(), header_cols);
     let wall: f64 = cols[0].parse().expect("wall time parses");
     assert!(wall >= 0.0);
 }
@@ -134,7 +138,8 @@ fn trace_flag_writes_per_tick_tsv() {
     assert_eq!(
         lines[0],
         "s\trss\tvms\tuss\tpss\tio_in\tio_out\tcpu_time\tn_procs\t\
-         major_page_faults\tminor_page_faults",
+         major_page_faults\tminor_page_faults\t\
+         voluntary_ctx_switches\tinvoluntary_ctx_switches",
         "unexpected trace header",
     );
     assert!(
@@ -143,11 +148,11 @@ fn trace_flag_writes_per_tick_tsv() {
         lines.len()
     );
 
+    let expected_cols = lines[0].split('\t').count();
     let mut last_elapsed = -1.0_f64;
     for row in &lines[1..] {
         let cols: Vec<&str> = row.split('\t').collect();
-        // 9 original trace columns + 2 page-fault delta columns.
-        assert_eq!(cols.len(), 11, "row has wrong column count: {row:?}");
+        assert_eq!(cols.len(), expected_cols, "row has wrong column count: {row:?}");
         let elapsed: f64 = cols[0].parse().expect("elapsed parses");
         assert!(elapsed >= last_elapsed, "elapsed should be monotonic");
         last_elapsed = elapsed;
@@ -168,11 +173,18 @@ fn export_markdown_writes_table_alongside_tsv() {
     let agg = std::fs::read_to_string(&out).expect("aggregate tsv");
     assert_eq!(agg.lines().count(), 2, "aggregate should still be header + 1 row");
 
-    // Markdown table in full mode: header + alignment + one data row per
-    // column in TSV_HEADER_FULL (currently 12 = 10 Snakemake + 2 page faults).
+    // Markdown table in full mode: header + alignment + one row per column
+    // in TSV_HEADER_FULL. Derive the expected line count from the TSV so
+    // metric PRs only need to update one source of truth.
     let md_text = std::fs::read_to_string(&md).expect("markdown file");
+    let agg_text = std::fs::read_to_string(&out).expect("aggregate tsv");
+    let expected_metric_rows = agg_text.lines().next().expect("agg header").split('\t').count();
     let lines: Vec<&str> = md_text.lines().collect();
-    assert_eq!(lines.len(), 14, "expected header + alignment + 12 metric rows: {md_text:?}");
+    assert_eq!(
+        lines.len(),
+        2 + expected_metric_rows,
+        "expected header + alignment + {expected_metric_rows} metric rows: {md_text:?}",
+    );
     assert!(lines[0].starts_with("| metric"), "unexpected header: {}", lines[0]);
     assert!(lines[1].starts_with("|:") && lines[1].ends_with(":|"), "alignment row: {}", lines[1]);
     assert!(lines.iter().any(|l| l.contains("| s ")), "no `s` row: {md_text:?}");
@@ -329,12 +341,16 @@ fn page_faults_appear_in_aggregate_tsv() {
     let text = std::fs::read_to_string(&out).expect("aggregate tsv");
     let header = text.lines().next().expect("header");
     assert!(header.contains("\tmajor_page_faults\tminor_page_faults"), "header: {header}");
+    let header_cols: Vec<&str> = header.split('\t').collect();
     let cols: Vec<&str> = text.lines().nth(1).expect("data row").split('\t').collect();
-    assert_eq!(cols.len(), 12, "expected 10 base columns + 2 page-fault columns: {cols:?}");
+    assert_eq!(cols.len(), header_cols.len(), "row col count mismatches header: {cols:?}");
 
-    // major_page_faults is column index 10; minor is 11.
-    let major = cols[10];
-    let minor = cols[11];
+    // Look up by name so column-order changes don't silently mis-target.
+    let pos = |name: &str| {
+        header_cols.iter().position(|c| *c == name).unwrap_or_else(|| panic!("col {name}"))
+    };
+    let major = cols[pos("major_page_faults")];
+    let minor = cols[pos("minor_page_faults")];
     // major may legitimately be "0" on a warm-cache run; minor on Linux must
     // be > 0 after touching 30 MiB across 4 KiB pages. macOS exposes only
     // major via rusage, so minor is "-" on macOS.
@@ -442,6 +458,65 @@ fn snakemake_strict_mode_does_not_affect_trace_columns() {
     );
 }
 
+/// Voluntary + involuntary context-switch columns are appended in full mode.
+/// On Linux both come from `/proc/<pid>/status`; on macOS the kernel does
+/// not expose them via `proc_pid_rusage`, so both columns render as `-`.
+#[test]
+fn context_switches_appear_in_aggregate_tsv() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("timing.tsv");
+    // Several short sleeps generate many voluntary context switches on Linux
+    // (each sleep yields the CPU). The wall time is long enough to guarantee
+    // a tick fires.
+    let result =
+        run_bench(&out, "tsv", &[], &["sh", "-c", "for i in 1 2 3 4 5 6 7 8; do sleep 0.05; done"]);
+    assert!(result.status.success(), "stderr: {}", String::from_utf8_lossy(&result.stderr));
+
+    let text = std::fs::read_to_string(&out).expect("aggregate tsv");
+    let header = text.lines().next().expect("header");
+    assert!(
+        header.contains("\tvoluntary_ctx_switches\tinvoluntary_ctx_switches"),
+        "header missing ctx-switch cols: {header}",
+    );
+    let header_cols: Vec<&str> = header.split('\t').collect();
+    let cols: Vec<&str> = text.lines().nth(1).expect("data row").split('\t').collect();
+    assert_eq!(cols.len(), header_cols.len(), "row col count mismatches header: {cols:?}");
+
+    // Look up by name so column-order changes don't silently mis-target.
+    let pos = |name: &str| {
+        header_cols.iter().position(|c| *c == name).unwrap_or_else(|| panic!("col {name}"))
+    };
+    let voluntary = cols[pos("voluntary_ctx_switches")];
+    let involuntary = cols[pos("involuntary_ctx_switches")];
+
+    #[cfg(target_os = "linux")]
+    {
+        let v: u64 = voluntary.parse().unwrap_or_else(|_| panic!("vol parses: {voluntary}"));
+        assert!(v > 0, "linux voluntary_ctx_switches {v} should be > 0 after 8 sleeps");
+        let _ = involuntary.parse::<u64>().expect("involuntary parses on linux");
+    }
+    #[cfg(target_os = "macos")]
+    {
+        assert_eq!(voluntary, "-", "macos voluntary_ctx_switches should be `-`");
+        assert_eq!(involuntary, "-", "macos involuntary_ctx_switches should be `-`");
+    }
+}
+
+#[test]
+fn snakemake_strict_mode_strips_ctx_switch_columns() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("timing.tsv");
+    let result = run_bench(&out, "tsv", &["--snakemake"], &["sh", "-c", "sleep 0.4"]);
+    assert!(result.status.success(), "stderr: {}", String::from_utf8_lossy(&result.stderr));
+
+    let text = std::fs::read_to_string(&out).unwrap();
+    let header = text.lines().next().unwrap();
+    assert!(!header.contains("voluntary_ctx_switches"), "strict header: {header}");
+    assert!(!header.contains("involuntary_ctx_switches"));
+    let cols: Vec<&str> = text.lines().nth(1).unwrap().split('\t').collect();
+    assert_eq!(cols.len(), 10, "strict mode row must still be 10 cols: {cols:?}");
+}
+
 fn python3_available() -> bool {
     Command::new("python3").arg("--version").output().is_ok_and(|o| o.status.success())
 }
@@ -502,8 +577,10 @@ while time.monotonic() < end:
     let lines: Vec<&str> = text.lines().collect();
     assert_eq!(lines.len(), 2, "expected header + 1 data row, got: {text:?}");
     let cols: Vec<&str> = lines[1].split('\t').collect();
-    // Default (full) mode: 10 Snakemake columns + 2 page-fault columns.
-    assert_eq!(cols.len(), 12);
+    // Default (full) mode: 10 Snakemake columns + every tricord-added
+    // column. Header drives the expected count so future metric PRs need
+    // not edit this assertion.
+    assert_eq!(cols.len(), lines[0].split('\t').count());
 
     let wall: f64 = cols[0].parse().expect("wall");
     let max_rss: f64 = cols[2].parse().expect("max_rss");

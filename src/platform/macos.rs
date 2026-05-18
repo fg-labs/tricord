@@ -155,6 +155,13 @@ fn sample_process(pid: i32) -> Option<ProcessSnapshot> {
         cpu_time_seconds,
         major_page_faults,
         minor_page_faults: None,
+        // `RUsageInfoV4` does not split context switches voluntary vs
+        // involuntary, and `proc_taskinfo::pti_csw` is the *total* — using
+        // it under a "voluntary" label would be misleading. Both columns
+        // stay `None` and render as `-`; if a future PR can plumb a more
+        // granular source we can populate them then.
+        voluntary_ctx_switches: None,
+        involuntary_ctx_switches: None,
     })
 }
 

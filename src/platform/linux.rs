@@ -85,6 +85,12 @@ fn sample_process(pid: i32, ticks_per_second: f64) -> Option<ProcessSnapshot> {
     let major_page_faults = Some(stat.majflt);
     let minor_page_faults = Some(stat.minflt);
 
+    // `/proc/<pid>/status` reports per-process context-switch counts under
+    // `voluntary_ctxt_switches` / `nonvoluntary_ctxt_switches`. We use
+    // "involuntary" as the public name (matches BSD `rusage` terminology).
+    let voluntary_ctx_switches = status.voluntary_ctxt_switches;
+    let involuntary_ctx_switches = status.nonvoluntary_ctxt_switches;
+
     Some(ProcessSnapshot {
         pid,
         rss_bytes,
@@ -96,6 +102,8 @@ fn sample_process(pid: i32, ticks_per_second: f64) -> Option<ProcessSnapshot> {
         cpu_time_seconds,
         major_page_faults,
         minor_page_faults,
+        voluntary_ctx_switches,
+        involuntary_ctx_switches,
     })
 }
 

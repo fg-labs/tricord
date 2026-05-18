@@ -59,6 +59,12 @@ pub struct ProcessSnapshot {
     /// did not expose them this sample (always `None` on macOS via
     /// `proc_pid_rusage`).
     pub minor_page_faults: Option<u64>,
+    /// Cumulative voluntary context switches for this process. `None` on
+    /// macOS — `proc_pid_rusage` does not split context switches.
+    pub voluntary_ctx_switches: Option<u64>,
+    /// Cumulative involuntary context switches for this process. `None` on
+    /// macOS.
+    pub involuntary_ctx_switches: Option<u64>,
 }
 
 /// Per-PID accumulator; used to keep the latest seen value of monotonically-
@@ -72,6 +78,8 @@ struct ProcessAccum {
     /// gives total tree faults, including exited children).
     major_page_faults: Option<u64>,
     minor_page_faults: Option<u64>,
+    voluntary_ctx_switches: Option<u64>,
+    involuntary_ctx_switches: Option<u64>,
 }
 
 /// Running aggregate of all snapshots taken during a benchmark run.
@@ -86,12 +94,33 @@ pub struct SamplerState {
     max_uss_bytes: Option<u64>,
     max_pss_bytes: Option<u64>,
     per_pid: HashMap<i32, ProcessAccum>,
-    /// Per-PID `(major, minor)` page-fault counts at the end of the last
-    /// tick — used to compute per-tick *deltas* for the trace TSV. Distinct
-    /// from `per_pid.major_page_faults` (which holds the running maximum used
-    /// for aggregate totals).
-    prev_page_faults: HashMap<i32, (u64, u64)>,
+    /// Per-PID cumulative counters at the end of the last tick — used to
+    /// compute per-tick *deltas* for the trace TSV. Distinct from the
+    /// matching fields on [`ProcessAccum`] (those hold the running maximum
+    /// used for aggregate totals; this is a point-in-time snapshot).
+    prev_cumulative: HashMap<i32, PrevCumulative>,
     data_collected: bool,
+}
+
+/// Per-PID cumulative-counter snapshot used to compute per-tick deltas.
+/// Each `tricord`-added per-tick metric needs a slot here; the type is
+/// `u64` because `saturating_sub` against an `Option<u64>` would be uglier.
+#[derive(Debug, Clone, Copy, Default)]
+struct PrevCumulative {
+    major_page_faults: u64,
+    minor_page_faults: u64,
+    voluntary_ctx_switches: u64,
+    involuntary_ctx_switches: u64,
+}
+
+/// Per-tick deltas of cumulative counters, summed across observed PIDs.
+/// `None` means no process exposed the counter this tick.
+#[derive(Debug, Default)]
+struct PerTickDeltas {
+    major_page_faults: Option<u64>,
+    minor_page_faults: Option<u64>,
+    voluntary_ctx_switches: Option<u64>,
+    involuntary_ctx_switches: Option<u64>,
 }
 
 /// Per-tick memory sums across the live tree. `uss` and `pss` are `None`
@@ -112,6 +141,8 @@ struct CumulativeTotals {
     cpu_time: f64,
     major_page_faults: Option<u64>,
     minor_page_faults: Option<u64>,
+    voluntary_ctx_switches: Option<u64>,
+    involuntary_ctx_switches: Option<u64>,
 }
 
 /// Sum memory across the snapshots in a single tick.
@@ -154,6 +185,10 @@ fn cumulative_totals(per_pid: &HashMap<i32, ProcessAccum>) -> CumulativeTotals {
     let mut minor_pf: u64 = 0;
     let mut any_major_pf = false;
     let mut any_minor_pf = false;
+    let mut vol_cs: u64 = 0;
+    let mut invol_cs: u64 = 0;
+    let mut any_vol_cs = false;
+    let mut any_invol_cs = false;
     for accum in per_pid.values() {
         if let Some(v) = accum.io_read_bytes {
             io_in = io_in.saturating_add(v);
@@ -172,6 +207,14 @@ fn cumulative_totals(per_pid: &HashMap<i32, ProcessAccum>) -> CumulativeTotals {
             minor_pf = minor_pf.saturating_add(v);
             any_minor_pf = true;
         }
+        if let Some(v) = accum.voluntary_ctx_switches {
+            vol_cs = vol_cs.saturating_add(v);
+            any_vol_cs = true;
+        }
+        if let Some(v) = accum.involuntary_ctx_switches {
+            invol_cs = invol_cs.saturating_add(v);
+            any_invol_cs = true;
+        }
     }
     CumulativeTotals {
         io_in: if any_io_in { Some(io_in) } else { None },
@@ -179,6 +222,8 @@ fn cumulative_totals(per_pid: &HashMap<i32, ProcessAccum>) -> CumulativeTotals {
         cpu_time,
         major_page_faults: if any_major_pf { Some(major_pf) } else { None },
         minor_page_faults: if any_minor_pf { Some(minor_pf) } else { None },
+        voluntary_ctx_switches: if any_vol_cs { Some(vol_cs) } else { None },
+        involuntary_ctx_switches: if any_invol_cs { Some(invol_cs) } else { None },
     }
 }
 
@@ -218,6 +263,14 @@ impl SamplerState {
             if let Some(v) = snap.minor_page_faults {
                 entry.minor_page_faults = Some(v.max(entry.minor_page_faults.unwrap_or(0)));
             }
+            if let Some(v) = snap.voluntary_ctx_switches {
+                entry.voluntary_ctx_switches =
+                    Some(v.max(entry.voluntary_ctx_switches.unwrap_or(0)));
+            }
+            if let Some(v) = snap.involuntary_ctx_switches {
+                entry.involuntary_ctx_switches =
+                    Some(v.max(entry.involuntary_ctx_switches.unwrap_or(0)));
+            }
         }
         self.data_collected = true;
     }
@@ -236,7 +289,7 @@ impl SamplerState {
     /// started (their counters started at zero).
     ///
     /// Takes `&mut self` because the per-tick delta requires snapshotting
-    /// the current per-PID values into [`Self::prev_page_faults`] so the
+    /// the current per-PID values into [`Self::prev_cumulative`] so the
     /// next tick can compute *its* delta.
     pub fn tick(
         &mut self,
@@ -249,7 +302,7 @@ impl SamplerState {
         let mem = sum_memory(snapshots);
         let cum = cumulative_totals(&self.per_pid);
 
-        let (major_delta, minor_delta) = self.compute_and_advance_page_fault_deltas(snapshots);
+        let deltas = self.compute_and_advance_per_tick_deltas(snapshots);
 
         Some(TickRecord {
             elapsed: elapsed_seconds,
@@ -261,51 +314,77 @@ impl SamplerState {
             io_out: cum.io_out.map(bytes_to_mib),
             cpu_time: cum.cpu_time,
             n_procs: snapshots.len(),
-            major_page_faults: major_delta,
-            minor_page_faults: minor_delta,
+            major_page_faults: deltas.major_page_faults,
+            minor_page_faults: deltas.minor_page_faults,
+            voluntary_ctx_switches: deltas.voluntary_ctx_switches,
+            involuntary_ctx_switches: deltas.involuntary_ctx_switches,
         })
     }
 
-    /// For each PID in `snapshots`, return the delta from the previous-tick
-    /// page-fault count (zero if never seen). Sum the deltas across PIDs and
-    /// update [`Self::prev_page_faults`] for the next call.
+    /// For each PID in `snapshots`, compute the delta from the previous-tick
+    /// cumulative counters (zero if never seen) for every per-tick metric,
+    /// summed across PIDs. Advance [`Self::prev_cumulative`] to the current
+    /// values so the next call computes its own correct delta.
     ///
-    /// `Option::None` is returned for major or minor when no process exposed
-    /// that counter this tick — same convention as the I/O fields, so the
-    /// trace TSV renders `-` rather than `0` and consumers can tell "not
-    /// observed" from "observed as zero."
-    fn compute_and_advance_page_fault_deltas(
+    /// Each metric returns `None` when no process exposed it this tick —
+    /// same convention as the I/O fields, so the trace TSV renders `-`
+    /// rather than `0` and consumers can tell "not observed" from "observed
+    /// as zero." `saturating_sub` guards against PID reuse (a recycled PID
+    /// starting at zero must not produce a phantom huge delta).
+    fn compute_and_advance_per_tick_deltas(
         &mut self,
         snapshots: &[ProcessSnapshot],
-    ) -> (Option<u64>, Option<u64>) {
-        let mut major_delta: u64 = 0;
-        let mut minor_delta: u64 = 0;
-        let mut any_major = false;
-        let mut any_minor = false;
+    ) -> PerTickDeltas {
+        let mut major_pf: u64 = 0;
+        let mut minor_pf: u64 = 0;
+        let mut vol_cs: u64 = 0;
+        let mut invol_cs: u64 = 0;
+        let mut any_major_pf = false;
+        let mut any_minor_pf = false;
+        let mut any_vol_cs = false;
+        let mut any_invol_cs = false;
         for snap in snapshots {
-            let prev = self.prev_page_faults.get(&snap.pid).copied().unwrap_or((0, 0));
+            let prev = self.prev_cumulative.get(&snap.pid).copied().unwrap_or_default();
             if let Some(current) = snap.major_page_faults {
-                major_delta = major_delta.saturating_add(current.saturating_sub(prev.0));
-                any_major = true;
+                major_pf = major_pf.saturating_add(current.saturating_sub(prev.major_page_faults));
+                any_major_pf = true;
             }
             if let Some(current) = snap.minor_page_faults {
-                minor_delta = minor_delta.saturating_add(current.saturating_sub(prev.1));
-                any_minor = true;
+                minor_pf = minor_pf.saturating_add(current.saturating_sub(prev.minor_page_faults));
+                any_minor_pf = true;
             }
-            // Advance prev to the current values (treat unobserved as 0 to
-            // avoid a phantom positive delta on next observation).
-            self.prev_page_faults.insert(
+            if let Some(current) = snap.voluntary_ctx_switches {
+                vol_cs = vol_cs.saturating_add(current.saturating_sub(prev.voluntary_ctx_switches));
+                any_vol_cs = true;
+            }
+            if let Some(current) = snap.involuntary_ctx_switches {
+                invol_cs =
+                    invol_cs.saturating_add(current.saturating_sub(prev.involuntary_ctx_switches));
+                any_invol_cs = true;
+            }
+            // Advance prev. Unobserved → preserve prior value (so a metric
+            // that drops out for one tick doesn't fabricate a delta when it
+            // returns); newly observed → use current.
+            self.prev_cumulative.insert(
                 snap.pid,
-                (
-                    snap.major_page_faults.unwrap_or(prev.0),
-                    snap.minor_page_faults.unwrap_or(prev.1),
-                ),
+                PrevCumulative {
+                    major_page_faults: snap.major_page_faults.unwrap_or(prev.major_page_faults),
+                    minor_page_faults: snap.minor_page_faults.unwrap_or(prev.minor_page_faults),
+                    voluntary_ctx_switches: snap
+                        .voluntary_ctx_switches
+                        .unwrap_or(prev.voluntary_ctx_switches),
+                    involuntary_ctx_switches: snap
+                        .involuntary_ctx_switches
+                        .unwrap_or(prev.involuntary_ctx_switches),
+                },
             );
         }
-        (
-            if any_major { Some(major_delta) } else { None },
-            if any_minor { Some(minor_delta) } else { None },
-        )
+        PerTickDeltas {
+            major_page_faults: if any_major_pf { Some(major_pf) } else { None },
+            minor_page_faults: if any_minor_pf { Some(minor_pf) } else { None },
+            voluntary_ctx_switches: if any_vol_cs { Some(vol_cs) } else { None },
+            involuntary_ctx_switches: if any_invol_cs { Some(invol_cs) } else { None },
+        }
     }
 
     /// Materialize the running aggregate into a [`BenchmarkRecord`] given the
@@ -337,6 +416,8 @@ impl SamplerState {
             cpu_time: cum.cpu_time,
             major_page_faults: cum.major_page_faults,
             minor_page_faults: cum.minor_page_faults,
+            voluntary_ctx_switches: cum.voluntary_ctx_switches,
+            involuntary_ctx_switches: cum.involuntary_ctx_switches,
             data_collected: true,
         }
     }
@@ -689,10 +770,10 @@ mod tests {
         assert_eq!(lines[0], TRACE_TSV_HEADER, "first line should be the trace header");
         assert!(lines.len() >= 3, "expected header + multiple data rows, got: {text:?}");
         let mut last_elapsed = -1.0_f64;
+        let expected_cols = TRACE_TSV_HEADER.split('\t').count();
         for row in &lines[1..] {
             let cols: Vec<&str> = row.split('\t').collect();
-            // 9 original trace columns + 2 page-fault delta columns.
-            assert_eq!(cols.len(), 11, "row has wrong column count: {row:?}");
+            assert_eq!(cols.len(), expected_cols, "row has wrong column count: {row:?}");
             let elapsed: f64 = cols[0].parse().expect("elapsed parses");
             assert!(elapsed >= last_elapsed, "elapsed should be monotonic: {row:?}");
             last_elapsed = elapsed;
