@@ -149,6 +149,137 @@ fn trace_flag_writes_per_tick_tsv() {
 }
 
 #[test]
+fn export_markdown_writes_table_alongside_tsv() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("timing.tsv");
+    let md = tmp.path().join("timing.md");
+    let md_str = md.to_str().expect("utf8 md path");
+
+    let result = run_bench(&out, "tsv", &["--export-markdown", md_str], &["sh", "-c", "sleep 0.4"]);
+    assert!(result.status.success(), "stderr: {}", String::from_utf8_lossy(&result.stderr));
+
+    // The primary TSV is unaffected by --export-markdown.
+    let agg = std::fs::read_to_string(&out).expect("aggregate tsv");
+    assert_eq!(agg.lines().count(), 2, "aggregate should still be header + 1 row");
+
+    // Markdown table: header row, alignment row, then exactly 10 data rows
+    // (one per column in TSV_HEADER).
+    let md_text = std::fs::read_to_string(&md).expect("markdown file");
+    let lines: Vec<&str> = md_text.lines().collect();
+    assert_eq!(lines.len(), 12, "expected header + alignment + 10 metric rows: {md_text:?}");
+    assert!(lines[0].starts_with("| metric"), "unexpected header: {}", lines[0]);
+    assert!(lines[1].starts_with("|:") && lines[1].ends_with(":|"), "alignment row: {}", lines[1]);
+    assert!(lines.iter().any(|l| l.contains("| s ")), "no `s` row: {md_text:?}");
+    assert!(lines.iter().any(|l| l.contains("| cpu_time ")), "no `cpu_time` row: {md_text:?}");
+}
+
+#[test]
+fn export_markdown_and_trace_can_be_combined() {
+    // Lock down the "can be combined" contract — every sidecar path is
+    // independent of the others and the primary output.
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("timing.tsv");
+    let md = tmp.path().join("timing.md");
+    let trace = tmp.path().join("trace.tsv");
+    let result = run_bench(
+        &out,
+        "tsv",
+        &[
+            "--export-markdown",
+            md.to_str().expect("utf8 md path"),
+            "--trace",
+            trace.to_str().expect("utf8 trace path"),
+        ],
+        &["sh", "-c", "sleep 0.4"],
+    );
+    assert!(result.status.success(), "stderr: {}", String::from_utf8_lossy(&result.stderr));
+    let md_text = std::fs::read_to_string(&md).expect("markdown file");
+    assert!(md_text.lines().next().is_some_and(|l| l.starts_with("| metric")));
+    let trace_text = std::fs::read_to_string(&trace).expect("trace file");
+    assert!(trace_text.lines().next().is_some_and(|l| l.starts_with("s\trss")));
+    let agg_text = std::fs::read_to_string(&out).expect("agg file");
+    assert_eq!(agg_text.lines().count(), 2, "aggregate should still be header + 1 row");
+}
+
+#[test]
+fn export_markdown_same_path_as_out_is_rejected() {
+    // Pointing two output flags at the same path would silently clobber.
+    // tricorder should refuse before running the child, surfacing both the
+    // conflicting path and the involved flag names.
+    let tmp = tempfile::tempdir().unwrap();
+    let shared = tmp.path().join("clash.tsv");
+    let shared_str = shared.to_str().expect("utf8");
+    let result =
+        run_bench(&shared, "tsv", &["--export-markdown", shared_str], &["sh", "-c", "true"]);
+    assert!(!result.status.success(), "tricorder should refuse colliding paths");
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(stderr.contains("--out") && stderr.contains("--export-markdown"), "stderr: {stderr}");
+    assert!(stderr.contains("clash.tsv"), "stderr should name the offending path: {stderr}");
+}
+
+#[test]
+fn export_markdown_same_path_as_trace_is_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("timing.tsv");
+    let shared = tmp.path().join("clash.tsv");
+    let shared_str = shared.to_str().expect("utf8");
+    let result = run_bench(
+        &out,
+        "tsv",
+        &["--trace", shared_str, "--export-markdown", shared_str],
+        &["sh", "-c", "true"],
+    );
+    assert!(!result.status.success());
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(stderr.contains("--trace") && stderr.contains("--export-markdown"), "stderr: {stderr}");
+}
+
+#[test]
+fn trace_same_path_as_out_is_rejected() {
+    // Sibling fix: --out and --trace can also silently clobber today;
+    // close that with the same check.
+    let tmp = tempfile::tempdir().unwrap();
+    let shared = tmp.path().join("clash.tsv");
+    let shared_str = shared.to_str().expect("utf8");
+    let result = run_bench(&shared, "tsv", &["--trace", shared_str], &["sh", "-c", "true"]);
+    assert!(!result.status.success());
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(stderr.contains("--out") && stderr.contains("--trace"), "stderr: {stderr}");
+}
+
+#[test]
+fn export_markdown_is_independent_of_primary_format() {
+    // The Markdown sidecar must work with any `--format` value for the
+    // primary `--out` file, not just TSV. Catches accidental coupling.
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("timing.json");
+    let md = tmp.path().join("timing.md");
+    let md_str = md.to_str().expect("utf8 md path");
+
+    let result = run_bench(&out, "json", &["--export-markdown", md_str], &["sh", "-c", "true"]);
+    assert!(result.status.success(), "stderr: {}", String::from_utf8_lossy(&result.stderr));
+
+    let json_text = std::fs::read_to_string(&out).unwrap();
+    let value: serde_json::Value = serde_json::from_str(json_text.trim()).expect("valid json");
+    assert!(value.is_object(), "primary output should still be JSON: {json_text}");
+
+    let md_text = std::fs::read_to_string(&md).expect("markdown file");
+    assert!(md_text.lines().next().is_some_and(|l| l.starts_with("| metric")));
+}
+
+#[test]
+fn export_markdown_parent_directory_is_created() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("timing.tsv");
+    let md = tmp.path().join("nested/dir/timing.md");
+    let md_str = md.to_str().expect("utf8 md path");
+
+    let result = run_bench(&out, "tsv", &["--export-markdown", md_str], &["sh", "-c", "true"]);
+    assert!(result.status.success(), "stderr: {}", String::from_utf8_lossy(&result.stderr));
+    assert!(md.exists(), "markdown file should be created in nested directory");
+}
+
+#[test]
 fn trace_parent_directory_is_created() {
     let tmp = tempfile::tempdir().unwrap();
     let out = tmp.path().join("timing.tsv");

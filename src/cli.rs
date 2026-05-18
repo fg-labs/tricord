@@ -42,6 +42,13 @@ pub struct Args {
     #[arg(long, value_name = "PATH")]
     pub trace: Option<PathBuf>,
 
+    /// Optional path for an additional Markdown table of the aggregate
+    /// record. Designed for pasting into PR descriptions, issue comments,
+    /// and design docs; written alongside the primary `--out` file. Per-tick
+    /// trace output stays TSV-only — Markdown is for the single-row summary.
+    #[arg(long, value_name = "PATH")]
+    pub export_markdown: Option<PathBuf>,
+
     /// Verbosity (each `-v` raises the log level: warn → info → debug → trace).
     #[arg(short, long, action = clap::ArgAction::Count)]
     pub verbose: u8,
@@ -155,6 +162,26 @@ mod tests {
     fn trace_defaults_to_none() {
         let args = Args::parse_from(["tricorder", "--out", "out.tsv", "--", "true"]);
         assert!(args.trace.is_none());
+    }
+
+    #[test]
+    fn parses_export_markdown_path() {
+        let args = Args::parse_from([
+            "tricorder",
+            "--out",
+            "out.tsv",
+            "--export-markdown",
+            "/tmp/timing.md",
+            "--",
+            "true",
+        ]);
+        assert_eq!(args.export_markdown, Some(PathBuf::from("/tmp/timing.md")));
+    }
+
+    #[test]
+    fn export_markdown_defaults_to_none() {
+        let args = Args::parse_from(["tricorder", "--out", "out.tsv", "--", "true"]);
+        assert!(args.export_markdown.is_none());
     }
 
     #[test]

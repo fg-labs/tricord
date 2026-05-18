@@ -24,6 +24,7 @@
 //!     format: OutputFormat::Tsv,
 //!     force_summary: false,
 //!     trace_path: None,
+//!     markdown_path: None,
 //! };
 //! let outcome = run_command("echo", &["hello".to_string()], &options).unwrap();
 //! assert_eq!(outcome.exit_code(), 0);
