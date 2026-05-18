@@ -78,6 +78,13 @@ fn sample_process(pid: i32, ticks_per_second: f64) -> Option<ProcessSnapshot> {
     let cpu_ticks = stat.utime.saturating_add(stat.stime);
     let cpu_time_seconds = (cpu_ticks as f64) / ticks_per_second;
 
+    // `/proc/<pid>/stat` reports per-process page faults directly. The
+    // `c{min,maj}flt` siblings count exited children — we already track each
+    // PID in our own per-PID accumulator, so using the c-variants would
+    // double-count. `minflt` and `majflt` are u64 in modern procfs.
+    let major_page_faults = Some(stat.majflt);
+    let minor_page_faults = Some(stat.minflt);
+
     Some(ProcessSnapshot {
         pid,
         rss_bytes,
@@ -87,6 +94,8 @@ fn sample_process(pid: i32, ticks_per_second: f64) -> Option<ProcessSnapshot> {
         io_read_bytes,
         io_write_bytes,
         cpu_time_seconds,
+        major_page_faults,
+        minor_page_faults,
     })
 }
 

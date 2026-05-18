@@ -38,6 +38,10 @@ pub const DEFAULT_INTERVAL: Duration = Duration::from_millis(500);
 ///
 /// All byte-valued fields are raw bytes (the [`SamplerState`] aggregator
 /// converts to MiB when it produces the final record).
+///
+/// Page-fault counts are cumulative-since-process-birth integers, like the
+/// I/O byte counters; per-tick deltas are computed downstream in
+/// [`SamplerState::tick`].
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ProcessSnapshot {
     pub pid: i32,
@@ -48,6 +52,13 @@ pub struct ProcessSnapshot {
     pub io_read_bytes: Option<u64>,
     pub io_write_bytes: Option<u64>,
     pub cpu_time_seconds: f64,
+    /// Cumulative major page faults for this process. `None` if the platform
+    /// did not expose them this sample.
+    pub major_page_faults: Option<u64>,
+    /// Cumulative minor page faults for this process. `None` if the platform
+    /// did not expose them this sample (always `None` on macOS via
+    /// `proc_pid_rusage`).
+    pub minor_page_faults: Option<u64>,
 }
 
 /// Per-PID accumulator; used to keep the latest seen value of monotonically-
@@ -57,6 +68,10 @@ struct ProcessAccum {
     io_read_bytes: Option<u64>,
     io_write_bytes: Option<u64>,
     cpu_time_seconds: f64,
+    /// Running max of cumulative major page faults (so summing across PIDs
+    /// gives total tree faults, including exited children).
+    major_page_faults: Option<u64>,
+    minor_page_faults: Option<u64>,
 }
 
 /// Running aggregate of all snapshots taken during a benchmark run.
@@ -71,6 +86,11 @@ pub struct SamplerState {
     max_uss_bytes: Option<u64>,
     max_pss_bytes: Option<u64>,
     per_pid: HashMap<i32, ProcessAccum>,
+    /// Per-PID `(major, minor)` page-fault counts at the end of the last
+    /// tick — used to compute per-tick *deltas* for the trace TSV. Distinct
+    /// from `per_pid.major_page_faults` (which holds the running maximum used
+    /// for aggregate totals).
+    prev_page_faults: HashMap<i32, (u64, u64)>,
     data_collected: bool,
 }
 
@@ -84,11 +104,14 @@ struct MemorySums {
 }
 
 /// Cumulative I/O and CPU totals across every PID observed so far. `io_in`
-/// and `io_out` are `None` when no process has ever exposed I/O counters.
+/// and `io_out` are `None` when no process has ever exposed I/O counters;
+/// `major_page_faults` and `minor_page_faults` likewise.
 struct CumulativeTotals {
     io_in: Option<u64>,
     io_out: Option<u64>,
     cpu_time: f64,
+    major_page_faults: Option<u64>,
+    minor_page_faults: Option<u64>,
 }
 
 /// Sum memory across the snapshots in a single tick.
@@ -119,14 +142,18 @@ fn sum_memory(snapshots: &[ProcessSnapshot]) -> MemorySums {
     }
 }
 
-/// Sum the per-PID accumulators for I/O and CPU. Includes PIDs whose
-/// processes have already exited (last-observed value persists).
+/// Sum the per-PID accumulators for I/O, CPU, and page faults. Includes PIDs
+/// whose processes have already exited (last-observed value persists).
 fn cumulative_totals(per_pid: &HashMap<i32, ProcessAccum>) -> CumulativeTotals {
     let mut io_in: u64 = 0;
     let mut io_out: u64 = 0;
     let mut any_io_in = false;
     let mut any_io_out = false;
     let mut cpu_time = 0.0_f64;
+    let mut major_pf: u64 = 0;
+    let mut minor_pf: u64 = 0;
+    let mut any_major_pf = false;
+    let mut any_minor_pf = false;
     for accum in per_pid.values() {
         if let Some(v) = accum.io_read_bytes {
             io_in = io_in.saturating_add(v);
@@ -137,11 +164,21 @@ fn cumulative_totals(per_pid: &HashMap<i32, ProcessAccum>) -> CumulativeTotals {
             any_io_out = true;
         }
         cpu_time += accum.cpu_time_seconds;
+        if let Some(v) = accum.major_page_faults {
+            major_pf = major_pf.saturating_add(v);
+            any_major_pf = true;
+        }
+        if let Some(v) = accum.minor_page_faults {
+            minor_pf = minor_pf.saturating_add(v);
+            any_minor_pf = true;
+        }
     }
     CumulativeTotals {
         io_in: if any_io_in { Some(io_in) } else { None },
         io_out: if any_io_out { Some(io_out) } else { None },
         cpu_time,
+        major_page_faults: if any_major_pf { Some(major_pf) } else { None },
+        minor_page_faults: if any_minor_pf { Some(minor_pf) } else { None },
     }
 }
 
@@ -175,6 +212,12 @@ impl SamplerState {
             if snap.cpu_time_seconds > entry.cpu_time_seconds {
                 entry.cpu_time_seconds = snap.cpu_time_seconds;
             }
+            if let Some(v) = snap.major_page_faults {
+                entry.major_page_faults = Some(v.max(entry.major_page_faults.unwrap_or(0)));
+            }
+            if let Some(v) = snap.minor_page_faults {
+                entry.minor_page_faults = Some(v.max(entry.minor_page_faults.unwrap_or(0)));
+            }
         }
         self.data_collected = true;
     }
@@ -185,14 +228,29 @@ impl SamplerState {
     ///
     /// Memory totals are instantaneous (summed across `snapshots`); I/O and
     /// CPU are cumulative across every PID observed so far, including
-    /// children that have already exited.
-    #[must_use]
-    pub fn tick(&self, snapshots: &[ProcessSnapshot], elapsed_seconds: f64) -> Option<TickRecord> {
+    /// children that have already exited. Page-fault columns are *deltas*
+    /// for the current tick — for each PID, the difference between the
+    /// current sample and the previous-tick observation, summed across all
+    /// PIDs in this tick. The first observation of a PID is treated as a
+    /// delta from zero, which is correct for PIDs born after `tricord`
+    /// started (their counters started at zero).
+    ///
+    /// Takes `&mut self` because the per-tick delta requires snapshotting
+    /// the current per-PID values into [`Self::prev_page_faults`] so the
+    /// next tick can compute *its* delta.
+    pub fn tick(
+        &mut self,
+        snapshots: &[ProcessSnapshot],
+        elapsed_seconds: f64,
+    ) -> Option<TickRecord> {
         if snapshots.is_empty() {
             return None;
         }
         let mem = sum_memory(snapshots);
         let cum = cumulative_totals(&self.per_pid);
+
+        let (major_delta, minor_delta) = self.compute_and_advance_page_fault_deltas(snapshots);
+
         Some(TickRecord {
             elapsed: elapsed_seconds,
             rss: bytes_to_mib(mem.rss),
@@ -203,7 +261,51 @@ impl SamplerState {
             io_out: cum.io_out.map(bytes_to_mib),
             cpu_time: cum.cpu_time,
             n_procs: snapshots.len(),
+            major_page_faults: major_delta,
+            minor_page_faults: minor_delta,
         })
+    }
+
+    /// For each PID in `snapshots`, return the delta from the previous-tick
+    /// page-fault count (zero if never seen). Sum the deltas across PIDs and
+    /// update [`Self::prev_page_faults`] for the next call.
+    ///
+    /// `Option::None` is returned for major or minor when no process exposed
+    /// that counter this tick — same convention as the I/O fields, so the
+    /// trace TSV renders `-` rather than `0` and consumers can tell "not
+    /// observed" from "observed as zero."
+    fn compute_and_advance_page_fault_deltas(
+        &mut self,
+        snapshots: &[ProcessSnapshot],
+    ) -> (Option<u64>, Option<u64>) {
+        let mut major_delta: u64 = 0;
+        let mut minor_delta: u64 = 0;
+        let mut any_major = false;
+        let mut any_minor = false;
+        for snap in snapshots {
+            let prev = self.prev_page_faults.get(&snap.pid).copied().unwrap_or((0, 0));
+            if let Some(current) = snap.major_page_faults {
+                major_delta = major_delta.saturating_add(current.saturating_sub(prev.0));
+                any_major = true;
+            }
+            if let Some(current) = snap.minor_page_faults {
+                minor_delta = minor_delta.saturating_add(current.saturating_sub(prev.1));
+                any_minor = true;
+            }
+            // Advance prev to the current values (treat unobserved as 0 to
+            // avoid a phantom positive delta on next observation).
+            self.prev_page_faults.insert(
+                snap.pid,
+                (
+                    snap.major_page_faults.unwrap_or(prev.0),
+                    snap.minor_page_faults.unwrap_or(prev.1),
+                ),
+            );
+        }
+        (
+            if any_major { Some(major_delta) } else { None },
+            if any_minor { Some(minor_delta) } else { None },
+        )
     }
 
     /// Materialize the running aggregate into a [`BenchmarkRecord`] given the
@@ -233,6 +335,8 @@ impl SamplerState {
             io_out: cum.io_out.map(bytes_to_mib),
             mean_load,
             cpu_time: cum.cpu_time,
+            major_page_faults: cum.major_page_faults,
+            minor_page_faults: cum.minor_page_faults,
             data_collected: true,
         }
     }
@@ -392,6 +496,7 @@ mod tests {
             io_read_bytes: Some(1024 * 1024),
             io_write_bytes: Some(2 * 1024 * 1024),
             cpu_time_seconds: 0.5,
+            ..Default::default()
         }]);
         let record = state.into_record(2.0);
         assert!(record.data_collected);
@@ -403,6 +508,9 @@ mod tests {
         assert_eq!(record.io_out, Some(2.0));
         assert!((record.cpu_time - 0.5).abs() < 1e-9);
         assert!((record.mean_load - 25.0).abs() < 1e-9); // 0.5s cpu / 2.0s wall = 25%.
+        // Page faults default to None when the platform never reported them.
+        assert!(record.major_page_faults.is_none());
+        assert!(record.minor_page_faults.is_none());
     }
 
     #[test]
@@ -491,6 +599,7 @@ mod tests {
             io_read_bytes: Some(2 * 1024 * 1024),
             io_write_bytes: Some(3 * 1024 * 1024),
             cpu_time_seconds: 0.7,
+            ..Default::default()
         }];
         state.absorb(snaps);
         let tick = state.tick(snaps, 1.5).expect("tick");
@@ -507,7 +616,7 @@ mod tests {
 
     #[test]
     fn tick_returns_none_for_empty_snapshots() {
-        let state = SamplerState::default();
+        let mut state = SamplerState::default();
         assert!(state.tick(&[], 1.0).is_none());
     }
 
@@ -582,7 +691,8 @@ mod tests {
         let mut last_elapsed = -1.0_f64;
         for row in &lines[1..] {
             let cols: Vec<&str> = row.split('\t').collect();
-            assert_eq!(cols.len(), 9, "row has wrong column count: {row:?}");
+            // 9 original trace columns + 2 page-fault delta columns.
+            assert_eq!(cols.len(), 11, "row has wrong column count: {row:?}");
             let elapsed: f64 = cols[0].parse().expect("elapsed parses");
             assert!(elapsed >= last_elapsed, "elapsed should be monotonic: {row:?}");
             last_elapsed = elapsed;
@@ -627,6 +737,124 @@ mod tests {
     }
 
     #[test]
+    fn page_faults_aggregate_sums_per_pid_max_across_tree() {
+        let mut state = SamplerState::default();
+        // Tick 1: child A (100 maj, 5000 min), child B (50 maj, 2000 min).
+        state.absorb(&[
+            ProcessSnapshot {
+                pid: 10,
+                rss_bytes: 1,
+                vms_bytes: 1,
+                major_page_faults: Some(100),
+                minor_page_faults: Some(5000),
+                ..Default::default()
+            },
+            ProcessSnapshot {
+                pid: 11,
+                rss_bytes: 1,
+                vms_bytes: 1,
+                major_page_faults: Some(50),
+                minor_page_faults: Some(2000),
+                ..Default::default()
+            },
+        ]);
+        // Tick 2: B exited; A reached (150, 6500).
+        state.absorb(&[ProcessSnapshot {
+            pid: 10,
+            rss_bytes: 1,
+            vms_bytes: 1,
+            major_page_faults: Some(150),
+            minor_page_faults: Some(6500),
+            ..Default::default()
+        }]);
+        let record = state.into_record(1.0);
+        // Aggregate = sum of per-PID maxima = A(150,6500) + B(50,2000)
+        assert_eq!(record.major_page_faults, Some(200));
+        assert_eq!(record.minor_page_faults, Some(8500));
+    }
+
+    #[test]
+    fn tick_page_faults_are_per_tick_deltas() {
+        let mut state = SamplerState::default();
+        // Tick 1: pid 1 at (10, 100). First observation → delta from 0.
+        let t1 = [ProcessSnapshot {
+            pid: 1,
+            rss_bytes: 1,
+            vms_bytes: 1,
+            major_page_faults: Some(10),
+            minor_page_faults: Some(100),
+            ..Default::default()
+        }];
+        state.absorb(&t1);
+        let tick1 = state.tick(&t1, 0.5).expect("tick1");
+        assert_eq!(tick1.major_page_faults, Some(10));
+        assert_eq!(tick1.minor_page_faults, Some(100));
+
+        // Tick 2: pid 1 at (25, 400). Delta should be (15, 300).
+        let t2 = [ProcessSnapshot {
+            pid: 1,
+            rss_bytes: 1,
+            vms_bytes: 1,
+            major_page_faults: Some(25),
+            minor_page_faults: Some(400),
+            ..Default::default()
+        }];
+        state.absorb(&t2);
+        let tick2 = state.tick(&t2, 1.0).expect("tick2");
+        assert_eq!(tick2.major_page_faults, Some(15));
+        assert_eq!(tick2.minor_page_faults, Some(300));
+    }
+
+    #[test]
+    fn tick_page_faults_saturate_on_pid_reuse() {
+        // If a PID is reused (process exits, OS reassigns the pid), the new
+        // process starts its counters at 0. saturating_sub prevents a
+        // phantom "negative" delta from becoming a huge u64 wrap-around.
+        let mut state = SamplerState::default();
+        let t1 = [ProcessSnapshot {
+            pid: 7,
+            rss_bytes: 1,
+            vms_bytes: 1,
+            major_page_faults: Some(500),
+            minor_page_faults: Some(10_000),
+            ..Default::default()
+        }];
+        state.absorb(&t1);
+        let _ = state.tick(&t1, 0.5);
+        // Same pid, lower counters (new process under reused pid).
+        let t2 = [ProcessSnapshot {
+            pid: 7,
+            rss_bytes: 1,
+            vms_bytes: 1,
+            major_page_faults: Some(3),
+            minor_page_faults: Some(40),
+            ..Default::default()
+        }];
+        state.absorb(&t2);
+        let tick = state.tick(&t2, 1.0).expect("tick2");
+        // Saturating delta is 0, not 2^64 - 497.
+        assert_eq!(tick.major_page_faults, Some(0));
+        assert_eq!(tick.minor_page_faults, Some(0));
+    }
+
+    #[test]
+    fn tick_page_faults_none_when_no_process_exposes_them() {
+        let mut state = SamplerState::default();
+        let snaps = [ProcessSnapshot {
+            pid: 1,
+            rss_bytes: 1,
+            vms_bytes: 1,
+            major_page_faults: None,
+            minor_page_faults: None,
+            ..Default::default()
+        }];
+        state.absorb(&snaps);
+        let tick = state.tick(&snaps, 0.5).expect("tick");
+        assert!(tick.major_page_faults.is_none());
+        assert!(tick.minor_page_faults.is_none());
+    }
+
+    #[test]
     fn missing_uss_and_io_remain_none_in_record() {
         let mut state = SamplerState::default();
         state.absorb(&[ProcessSnapshot {
@@ -638,6 +866,7 @@ mod tests {
             io_read_bytes: None,
             io_write_bytes: None,
             cpu_time_seconds: 0.0,
+            ..Default::default()
         }]);
         let record = state.into_record(1.0);
         assert!(record.max_uss.is_none());

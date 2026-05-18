@@ -10,7 +10,7 @@ use std::{
 
 use crate::{
     format::{self, OutputFormat},
-    record::BenchmarkRecord,
+    record::{BenchmarkRecord, SchemaMode},
     sampler::{SamplerHandle, SamplerOptions},
     signals::SignalForwarder,
 };
@@ -51,6 +51,10 @@ pub struct RunOptions {
     /// record (`--export-markdown`). `None` disables it. Written alongside
     /// `output_path`, not in place of it.
     pub markdown_path: Option<Box<Path>>,
+    /// Which schema the aggregate-record formatters (TSV, JSON, Markdown)
+    /// should emit. `SnakemakeStrict` strips `tricord`-added columns;
+    /// `Full` (the default) keeps them. The per-tick trace ignores this.
+    pub schema_mode: SchemaMode,
 }
 
 /// Spawn `command` (with `args`), benchmark its process tree, and write the
@@ -93,9 +97,9 @@ pub fn run_command(command: &str, args: &[String], options: &RunOptions) -> io::
     let record = sampler.stop();
     drop(signals);
 
-    format::write_to_path(&record, &options.output_path, options.format)?;
+    format::write_to_path(&record, &options.output_path, options.format, options.schema_mode)?;
     if let Some(path) = options.markdown_path.as_deref() {
-        format::write_markdown_to_path(&record, path)?;
+        format::write_markdown_to_path(&record, path, options.schema_mode)?;
     }
 
     if options.force_summary || io::stderr().is_terminal() {
@@ -181,6 +185,7 @@ mod tests {
             force_summary: false,
             trace_path: trace.map(|p| Path::new(p).into()),
             markdown_path: markdown.map(|p| Path::new(p).into()),
+            schema_mode: SchemaMode::Full,
         }
     }
 

@@ -16,6 +16,7 @@
 //! use tricord::{
 //!     run::{run_command, RunOptions},
 //!     format::OutputFormat,
+//!     SchemaMode,
 //! };
 //!
 //! let options = RunOptions {
@@ -25,6 +26,7 @@
 //!     force_summary: false,
 //!     trace_path: None,
 //!     markdown_path: None,
+//!     schema_mode: SchemaMode::Full,
 //! };
 //! let outcome = run_command("echo", &["hello".to_string()], &options).unwrap();
 //! assert_eq!(outcome.exit_code(), 0);
@@ -53,5 +55,5 @@ pub(crate) mod sampler;
 pub(crate) mod signals;
 
 pub use format::OutputFormat;
-pub use record::{BenchmarkRecord, TSV_HEADER};
+pub use record::{BenchmarkRecord, SchemaMode, TSV_HEADER, TSV_HEADER_FULL, tsv_header};
 pub use run::{RunOptions, RunOutcome, run_command};

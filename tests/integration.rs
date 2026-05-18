@@ -48,13 +48,16 @@ fn tsv_output_for_short_lived_command_has_correct_shape() {
     let text = std::fs::read_to_string(&out).expect("read tsv");
     let lines: Vec<&str> = text.lines().collect();
     assert_eq!(lines.len(), 2, "expected header + 1 data row, got: {text:?}");
+    // Default mode (no --snakemake): full schema, 10 Snakemake columns +
+    // 2 tricord-appended columns (page faults).
     assert_eq!(
         lines[0],
-        "s\th:m:s\tmax_rss\tmax_vms\tmax_uss\tmax_pss\tio_in\tio_out\tmean_load\tcpu_time"
+        "s\th:m:s\tmax_rss\tmax_vms\tmax_uss\tmax_pss\tio_in\tio_out\tmean_load\tcpu_time\t\
+         major_page_faults\tminor_page_faults",
     );
 
     let cols: Vec<&str> = lines[1].split('\t').collect();
-    assert_eq!(cols.len(), 10);
+    assert_eq!(cols.len(), 12);
     let wall: f64 = cols[0].parse().expect("wall time parses");
     assert!(wall >= 0.5, "wall time {wall} should be at least 0.5s");
     assert!(wall < 5.0, "wall time {wall} should be under 5s");
@@ -106,8 +109,8 @@ fn instant_exit_yields_na_row() {
     let cols: Vec<&str> = row.split('\t').collect();
     // Either we caught a sample (numbers) or we didn't (NA placeholders);
     // both are valid for an essentially-instant child. Just verify the row
-    // is well-formed.
-    assert_eq!(cols.len(), 10);
+    // is well-formed against the full-mode schema (12 columns).
+    assert_eq!(cols.len(), 12);
     let wall: f64 = cols[0].parse().expect("wall time parses");
     assert!(wall >= 0.0);
 }
@@ -129,8 +132,10 @@ fn trace_flag_writes_per_tick_tsv() {
     let trace_text = std::fs::read_to_string(&trace).expect("trace tsv");
     let lines: Vec<&str> = trace_text.lines().collect();
     assert_eq!(
-        lines[0], "s\trss\tvms\tuss\tpss\tio_in\tio_out\tcpu_time\tn_procs",
-        "unexpected trace header"
+        lines[0],
+        "s\trss\tvms\tuss\tpss\tio_in\tio_out\tcpu_time\tn_procs\t\
+         major_page_faults\tminor_page_faults",
+        "unexpected trace header",
     );
     assert!(
         lines.len() >= 3,
@@ -141,7 +146,8 @@ fn trace_flag_writes_per_tick_tsv() {
     let mut last_elapsed = -1.0_f64;
     for row in &lines[1..] {
         let cols: Vec<&str> = row.split('\t').collect();
-        assert_eq!(cols.len(), 9, "row has wrong column count: {row:?}");
+        // 9 original trace columns + 2 page-fault delta columns.
+        assert_eq!(cols.len(), 11, "row has wrong column count: {row:?}");
         let elapsed: f64 = cols[0].parse().expect("elapsed parses");
         assert!(elapsed >= last_elapsed, "elapsed should be monotonic");
         last_elapsed = elapsed;
@@ -162,15 +168,19 @@ fn export_markdown_writes_table_alongside_tsv() {
     let agg = std::fs::read_to_string(&out).expect("aggregate tsv");
     assert_eq!(agg.lines().count(), 2, "aggregate should still be header + 1 row");
 
-    // Markdown table: header row, alignment row, then exactly 10 data rows
-    // (one per column in TSV_HEADER).
+    // Markdown table in full mode: header + alignment + one data row per
+    // column in TSV_HEADER_FULL (currently 12 = 10 Snakemake + 2 page faults).
     let md_text = std::fs::read_to_string(&md).expect("markdown file");
     let lines: Vec<&str> = md_text.lines().collect();
-    assert_eq!(lines.len(), 12, "expected header + alignment + 10 metric rows: {md_text:?}");
+    assert_eq!(lines.len(), 14, "expected header + alignment + 12 metric rows: {md_text:?}");
     assert!(lines[0].starts_with("| metric"), "unexpected header: {}", lines[0]);
     assert!(lines[1].starts_with("|:") && lines[1].ends_with(":|"), "alignment row: {}", lines[1]);
     assert!(lines.iter().any(|l| l.contains("| s ")), "no `s` row: {md_text:?}");
     assert!(lines.iter().any(|l| l.contains("| cpu_time ")), "no `cpu_time` row: {md_text:?}");
+    assert!(
+        lines.iter().any(|l| l.contains("| major_page_faults ")),
+        "no page-fault row in full-mode Markdown: {md_text:?}",
+    );
 }
 
 #[test]
@@ -291,6 +301,147 @@ fn trace_parent_directory_is_created() {
     assert!(trace.exists(), "trace file should be created in nested directory");
 }
 
+/// Aggregate TSV picks up two new appended columns (`major_page_faults`,
+/// `minor_page_faults`). A workload that touches a large allocation should
+/// drive at least one of them above zero on Linux (`/proc/<pid>/stat`); on
+/// macOS only `major_page_faults` is populated (from `proc_pid_rusage`).
+#[test]
+fn page_faults_appear_in_aggregate_tsv() {
+    if !python3_available() {
+        assert!(std::env::var_os("CI").is_none(), "python3 not on PATH in CI");
+        eprintln!("skipping: python3 not on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("timing.tsv");
+    // 30 MiB allocation + page touch generates plenty of minor faults
+    // (and on a fresh process, some major faults from text/lib paging).
+    // The trailing sleep guarantees at least one sampling tick fires so
+    // `data_collected` is true and cells render as numbers / `-` rather
+    // than the all-`NA` short-lived-process placeholder row.
+    let workload = "import time\n\
+                    buf = bytearray(30 * 1024 * 1024)\n\
+                    for i in range(0, len(buf), 4096): buf[i] = i & 0xff\n\
+                    time.sleep(0.4)";
+    let result = run_bench(&out, "tsv", &[], &["python3", "-c", workload]);
+    assert!(result.status.success(), "stderr: {}", String::from_utf8_lossy(&result.stderr));
+
+    let text = std::fs::read_to_string(&out).expect("aggregate tsv");
+    let header = text.lines().next().expect("header");
+    assert!(header.contains("\tmajor_page_faults\tminor_page_faults"), "header: {header}");
+    let cols: Vec<&str> = text.lines().nth(1).expect("data row").split('\t').collect();
+    assert_eq!(cols.len(), 12, "expected 10 base columns + 2 page-fault columns: {cols:?}");
+
+    // major_page_faults is column index 10; minor is 11.
+    let major = cols[10];
+    let minor = cols[11];
+    // major may legitimately be "0" on a warm-cache run; minor on Linux must
+    // be > 0 after touching 30 MiB across 4 KiB pages. macOS exposes only
+    // major via rusage, so minor is "-" on macOS.
+    #[cfg(target_os = "linux")]
+    {
+        let minor_val: u64 = minor.parse().unwrap_or_else(|_| panic!("minor parses: {minor}"));
+        assert!(minor_val > 100, "linux minor_page_faults {minor_val} should be high");
+        let _ = major.parse::<u64>().expect("major parses on linux");
+    }
+    #[cfg(target_os = "macos")]
+    {
+        assert_eq!(minor, "-", "macos minor_page_faults should be `-`, got: {minor}");
+        let _ = major.parse::<u64>().expect("major parses on macos");
+    }
+}
+
+#[test]
+fn snakemake_strict_mode_strips_page_fault_columns() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("timing.tsv");
+    let result = run_bench(&out, "tsv", &["--snakemake"], &["sh", "-c", "sleep 0.4"]);
+    assert!(result.status.success(), "stderr: {}", String::from_utf8_lossy(&result.stderr));
+
+    let text = std::fs::read_to_string(&out).unwrap();
+    let header = text.lines().next().expect("header");
+    assert_eq!(
+        header, "s\th:m:s\tmax_rss\tmax_vms\tmax_uss\tmax_pss\tio_in\tio_out\tmean_load\tcpu_time",
+        "snakemake-strict header must be the original 10 columns",
+    );
+    let cols: Vec<&str> = text.lines().nth(1).expect("data row").split('\t').collect();
+    assert_eq!(cols.len(), 10, "strict mode row must have 10 columns: {cols:?}");
+}
+
+#[test]
+fn snakemake_strict_mode_strips_page_faults_from_json() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("timing.json");
+    let result = run_bench(&out, "json", &["--snakemake"], &["sh", "-c", "sleep 0.4"]);
+    assert!(result.status.success(), "stderr: {}", String::from_utf8_lossy(&result.stderr));
+
+    let text = std::fs::read_to_string(&out).unwrap();
+    let value: serde_json::Value = serde_json::from_str(text.trim()).expect("valid json");
+    let obj = value.as_object().expect("object");
+    assert!(
+        !obj.contains_key("major_page_faults"),
+        "strict-mode JSON must omit major_page_faults: {value}"
+    );
+    assert!(
+        !obj.contains_key("minor_page_faults"),
+        "strict-mode JSON must omit minor_page_faults: {value}"
+    );
+    assert!(obj.contains_key("running_time"));
+    assert!(obj.contains_key("data_collected"));
+}
+
+#[test]
+fn snakemake_strict_mode_strips_page_faults_from_markdown() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("timing.tsv");
+    let md = tmp.path().join("timing.md");
+    let md_str = md.to_str().expect("utf8");
+    let result = run_bench(
+        &out,
+        "tsv",
+        &["--snakemake", "--export-markdown", md_str],
+        &["sh", "-c", "sleep 0.4"],
+    );
+    assert!(result.status.success(), "stderr: {}", String::from_utf8_lossy(&result.stderr));
+
+    let md_text = std::fs::read_to_string(&md).unwrap();
+    assert!(
+        !md_text.contains("major_page_faults"),
+        "strict-mode Markdown must omit major_page_faults: {md_text}"
+    );
+    assert!(
+        !md_text.contains("minor_page_faults"),
+        "strict-mode Markdown must omit minor_page_faults: {md_text}"
+    );
+    // Still has the original 10 rows + header + alignment row.
+    assert_eq!(md_text.lines().count(), 12, "strict Markdown should be 12 lines: {md_text:?}");
+}
+
+#[test]
+fn snakemake_strict_mode_does_not_affect_trace_columns() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("timing.tsv");
+    let trace = tmp.path().join("trace.tsv");
+    let trace_str = trace.to_str().expect("utf8");
+    let result =
+        run_bench(&out, "tsv", &["--snakemake", "--trace", trace_str], &["sh", "-c", "sleep 0.4"]);
+    assert!(result.status.success(), "stderr: {}", String::from_utf8_lossy(&result.stderr));
+
+    // Aggregate TSV is strict (10 cols).
+    let agg_text = std::fs::read_to_string(&out).unwrap();
+    let agg_cols: Vec<&str> = agg_text.lines().nth(1).unwrap().split('\t').collect();
+    assert_eq!(agg_cols.len(), 10);
+
+    // Trace TSV is "ours" — strict mode does not touch it. Header must
+    // include the new page-fault columns.
+    let trace_text = std::fs::read_to_string(&trace).expect("trace");
+    let trace_header = trace_text.lines().next().expect("trace header");
+    assert!(
+        trace_header.contains("major_page_faults"),
+        "trace header must include page faults regardless of --snakemake: {trace_header}",
+    );
+}
+
 fn python3_available() -> bool {
     Command::new("python3").arg("--version").output().is_ok_and(|o| o.status.success())
 }
@@ -351,7 +502,8 @@ while time.monotonic() < end:
     let lines: Vec<&str> = text.lines().collect();
     assert_eq!(lines.len(), 2, "expected header + 1 data row, got: {text:?}");
     let cols: Vec<&str> = lines[1].split('\t').collect();
-    assert_eq!(cols.len(), 10);
+    // Default (full) mode: 10 Snakemake columns + 2 page-fault columns.
+    assert_eq!(cols.len(), 12);
 
     let wall: f64 = cols[0].parse().expect("wall");
     let max_rss: f64 = cols[2].parse().expect("max_rss");
