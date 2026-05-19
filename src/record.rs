@@ -21,7 +21,8 @@ pub const TSV_HEADER_FULL: &str = "s\th:m:s\tmax_rss\tmax_vms\tmax_uss\tmax_pss\
                                    major_page_faults\tminor_page_faults\t\
                                    voluntary_ctx_switches\tinvoluntary_ctx_switches\t\
                                    peak_n_threads\tpeak_n_procs\t\
-                                   loadavg_1m_start\tloadavg_1m_end";
+                                   loadavg_1m_start\tloadavg_1m_end\t\
+                                   max_swap";
 
 /// Return the appropriate aggregate header for the requested schema mode.
 #[must_use]
@@ -38,7 +39,7 @@ pub fn tsv_header(mode: SchemaMode) -> &'static str {
 pub const TRACE_TSV_HEADER: &str = "s\trss\tvms\tuss\tpss\tio_in\tio_out\tcpu_time\tn_procs\t\
                                     major_page_faults\tminor_page_faults\t\
                                     voluntary_ctx_switches\tinvoluntary_ctx_switches\t\
-                                    n_threads";
+                                    n_threads\tswap";
 
 /// Aggregate-output schema selector.
 ///
@@ -110,6 +111,10 @@ pub struct TickRecord {
     /// tick). `None` if no process exposed a thread count this tick;
     /// generally populated on both Linux and macOS.
     pub n_threads: Option<u64>,
+    /// Instantaneous summed swap usage across the live tree at this tick,
+    /// in MiB. `None` if no process exposed swap counters this tick —
+    /// always `None` on macOS (no public per-process swap API).
+    pub swap: Option<f64>,
 }
 
 impl TickRecord {
@@ -135,6 +140,8 @@ impl TickRecord {
             out.push('\t');
             out.push_str(&format_optional_u64(value));
         }
+        out.push('\t');
+        out.push_str(&format_optional_float(self.swap));
         out
     }
 }
@@ -202,6 +209,10 @@ pub struct BenchmarkRecord {
     /// (loadavg ~1) means something very different from the same peak on
     /// a thrashing host (loadavg 30).
     pub loadavg_1m_end: Option<f64>,
+    /// Peak summed swap usage across the process tree, in MiB. `None` if
+    /// no process exposed swap counters during the run — always `None` on
+    /// macOS (the kernel has no public per-process swap-usage API).
+    pub max_swap: Option<f64>,
     /// Whether at least one sample successfully read OS resource counters.
     ///
     /// When `false` the TSV row is rendered with `NA` placeholders for every
@@ -225,8 +236,8 @@ impl BenchmarkRecord {
 
         let extra_cols = match mode {
             // page faults (2) + ctx switches (2) + peak n_threads + n_procs
-            // + loadavg start/end (2) = 8
-            SchemaMode::Full => 8,
+            // + loadavg start/end (2) + max_swap = 9
+            SchemaMode::Full => 9,
             SchemaMode::SnakemakeStrict => 0,
         };
 
@@ -258,7 +269,7 @@ impl BenchmarkRecord {
             // peak_n_procs is a plain `u64`, not Option, so render bare —
             // when `data_collected` is true it's always populated.
             write!(out, "\t{}", self.peak_n_procs).unwrap();
-            for value in [self.loadavg_1m_start, self.loadavg_1m_end] {
+            for value in [self.loadavg_1m_start, self.loadavg_1m_end, self.max_swap] {
                 out.push('\t');
                 out.push_str(&format_optional_float(value));
             }
@@ -360,6 +371,7 @@ impl BenchmarkRecord {
             ));
             rows.push(("loadavg_1m_start", cell(self.loadavg_1m_start)));
             rows.push(("loadavg_1m_end", cell(self.loadavg_1m_end)));
+            rows.push(("max_swap", cell(self.max_swap)));
         }
         rows
     }
@@ -480,6 +492,7 @@ mod tests {
             peak_n_procs: 4,
             loadavg_1m_start: Some(0.50),
             loadavg_1m_end: Some(2.25),
+            max_swap: Some(64.00),
             data_collected: true,
         }
     }
@@ -568,11 +581,11 @@ mod tests {
     #[test]
     fn tsv_row_full_mode_appends_all_tricord_columns() {
         // full_record(): page faults 42/1234, ctx switches 80/7, peak
-        // threads 13, peak procs 4, loadavg 0.50 → 2.25.
+        // threads 13, peak procs 4, loadavg 0.50 → 2.25, max_swap 64.00.
         assert_eq!(
             full_record().to_tsv_row(SchemaMode::Full),
             "12.3456\t0:00:12\t101.50\t2048.00\t95.20\t96.00\t1.25\t0.50\t175.00\t21.60\t\
-             42\t1234\t80\t7\t13\t4\t0.50\t2.25",
+             42\t1234\t80\t7\t13\t4\t0.50\t2.25\t64.00",
         );
     }
 
@@ -589,7 +602,7 @@ mod tests {
     fn tsv_row_full_mode_renders_missing_tricord_metrics_as_dash() {
         // Option-typed tricord metrics render as `-` when None; the plain
         // `peak_n_procs: u64` renders as its bare integer (full_record's 4).
-        // Loadavg fields are Option<f64>, also render as `-`.
+        // Loadavg + max_swap fields are Option<f64>, also render as `-`.
         let record = BenchmarkRecord {
             major_page_faults: None,
             minor_page_faults: None,
@@ -598,10 +611,11 @@ mod tests {
             peak_n_threads: None,
             loadavg_1m_start: None,
             loadavg_1m_end: None,
+            max_swap: None,
             ..full_record()
         };
         let row = record.to_tsv_row(SchemaMode::Full);
-        assert!(row.ends_with("\t-\t-\t-\t-\t-\t4\t-\t-"), "row was: {row}");
+        assert!(row.ends_with("\t-\t-\t-\t-\t-\t4\t-\t-\t-"), "row was: {row}");
     }
 
     #[test]
@@ -654,7 +668,7 @@ mod tests {
             "s\trss\tvms\tuss\tpss\tio_in\tio_out\tcpu_time\tn_procs\t\
              major_page_faults\tminor_page_faults\t\
              voluntary_ctx_switches\tinvoluntary_ctx_switches\t\
-             n_threads"
+             n_threads\tswap"
         );
     }
 
@@ -675,10 +689,11 @@ mod tests {
             voluntary_ctx_switches: Some(11),
             involuntary_ctx_switches: Some(3),
             n_threads: Some(8),
+            swap: Some(16.50),
         };
         assert_eq!(
             tick.to_tsv_row(),
-            "0.5012\t102.30\t2048.00\t95.20\t96.00\t1.25\t0.50\t0.75\t3\t2\t150\t11\t3\t8"
+            "0.5012\t102.30\t2048.00\t95.20\t96.00\t1.25\t0.50\t0.75\t3\t2\t150\t11\t3\t8\t16.50"
         );
     }
 
@@ -699,8 +714,12 @@ mod tests {
             voluntary_ctx_switches: None,
             involuntary_ctx_switches: None,
             n_threads: None,
+            swap: None,
         };
-        assert_eq!(tick.to_tsv_row(), "1.0000\t10.00\t20.00\t-\t-\t-\t-\t0.00\t1\t-\t-\t-\t-\t-");
+        assert_eq!(
+            tick.to_tsv_row(),
+            "1.0000\t10.00\t20.00\t-\t-\t-\t-\t0.00\t1\t-\t-\t-\t-\t-\t-"
+        );
     }
 
     #[test]
@@ -733,6 +752,7 @@ mod tests {
 | peak_n_procs             |       4 |
 | loadavg_1m_start         |    0.50 |
 | loadavg_1m_end           |    2.25 |
+| max_swap                 |   64.00 |
 ";
         assert_eq!(full_record().to_markdown_document(SchemaMode::Full), expected);
     }
@@ -793,6 +813,7 @@ mod tests {
             peak_n_procs: 1,
             loadavg_1m_start: None,
             loadavg_1m_end: None,
+            max_swap: None,
             data_collected: true,
         };
         let doc = record.to_markdown_document(SchemaMode::Full);
@@ -807,6 +828,7 @@ mod tests {
             "peak_n_threads",
             "loadavg_1m_start",
             "loadavg_1m_end",
+            "max_swap",
         ] {
             let row = doc.lines().find(|l| l.contains(metric)).expect("metric row");
             assert!(row.contains(" - "), "expected dash in {metric} row: {row}");
