@@ -91,6 +91,10 @@ fn sample_process(pid: i32, ticks_per_second: f64) -> Option<ProcessSnapshot> {
     let voluntary_ctx_switches = status.voluntary_ctxt_switches;
     let involuntary_ctx_switches = status.nonvoluntary_ctxt_switches;
 
+    // `/proc/<pid>/status` exposes the live thread count under `Threads:`,
+    // surfaced as `status.threads` by procfs (`u64`).
+    let thread_count = Some(status.threads);
+
     Some(ProcessSnapshot {
         pid,
         rss_bytes,
@@ -104,6 +108,7 @@ fn sample_process(pid: i32, ticks_per_second: f64) -> Option<ProcessSnapshot> {
         minor_page_faults,
         voluntary_ctx_switches,
         involuntary_ctx_switches,
+        thread_count,
     })
 }
 

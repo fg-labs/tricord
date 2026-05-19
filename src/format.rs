@@ -121,6 +121,8 @@ mod tests {
             minor_page_faults: Some(120),
             voluntary_ctx_switches: Some(40),
             involuntary_ctx_switches: Some(5),
+            peak_n_threads: Some(6),
+            peak_n_procs: 2,
             data_collected: true,
         }
     }
@@ -132,11 +134,13 @@ mod tests {
         let text = std::str::from_utf8(&buf).unwrap();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 2);
-        assert!(lines[0].ends_with("\tinvoluntary_ctx_switches"));
         assert!(lines[0].contains("\tmajor_page_faults\tminor_page_faults\t"));
+        assert!(lines[0].contains("\tvoluntary_ctx_switches\tinvoluntary_ctx_switches\t"));
+        assert!(lines[0].contains("\tpeak_n_threads\tpeak_n_procs"));
         assert!(lines[1].starts_with("0.5000\t"));
-        // Sample record: major=3, minor=120, voluntary=40, involuntary=5.
-        assert!(lines[1].ends_with("\t3\t120\t40\t5"), "data row: {}", lines[1]);
+        // sample_record(): major=3 minor=120 voluntary=40 involuntary=5
+        //                  peak_n_threads=6 peak_n_procs=2
+        assert!(lines[1].ends_with("\t3\t120\t40\t5\t6\t2"), "data row: {}", lines[1]);
         assert!(text.ends_with('\n'));
     }
 

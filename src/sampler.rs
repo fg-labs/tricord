@@ -65,6 +65,11 @@ pub struct ProcessSnapshot {
     /// Cumulative involuntary context switches for this process. `None` on
     /// macOS.
     pub involuntary_ctx_switches: Option<u64>,
+    /// Number of live threads in this process at sample time. `None` if the
+    /// platform did not expose a thread count this sample. Used to derive
+    /// per-tick `n_threads` (sum across PIDs) and aggregate `peak_n_threads`
+    /// (max of those sums across ticks).
+    pub thread_count: Option<u64>,
 }
 
 /// Per-PID accumulator; used to keep the latest seen value of monotonically-
@@ -99,6 +104,13 @@ pub struct SamplerState {
     /// matching fields on [`ProcessAccum`] (those hold the running maximum
     /// used for aggregate totals; this is a point-in-time snapshot).
     prev_cumulative: HashMap<i32, PrevCumulative>,
+    /// Peak instantaneous live-thread count across the tree (max over ticks
+    /// of summed per-PID `thread_count`). `None` if no process ever exposed
+    /// a thread count.
+    max_n_threads: Option<u64>,
+    /// Peak instantaneous live-process count across the tree (max over
+    /// ticks of `snapshots.len()`).
+    max_n_procs: u64,
     data_collected: bool,
 }
 
@@ -231,6 +243,22 @@ fn bytes_to_mib(bytes: u64) -> f64 {
     (bytes as f64) / (1024.0 * 1024.0)
 }
 
+/// Sum the `thread_count` field across `snapshots`. Returns `None` when no
+/// process in the tick exposed a thread count (older platforms, restricted
+/// access) so the trace column renders `-` rather than `0` and aggregates
+/// stay `None` for the run.
+fn sum_thread_count(snapshots: &[ProcessSnapshot]) -> Option<u64> {
+    let mut total: u64 = 0;
+    let mut any = false;
+    for snap in snapshots {
+        if let Some(t) = snap.thread_count {
+            total = total.saturating_add(t);
+            any = true;
+        }
+    }
+    if any { Some(total) } else { None }
+}
+
 impl SamplerState {
     /// Fold one tick's worth of snapshots into the running aggregate.
     pub fn absorb(&mut self, snapshots: &[ProcessSnapshot]) {
@@ -246,6 +274,13 @@ impl SamplerState {
         if let Some(v) = sums.pss {
             self.max_pss_bytes = Some(self.max_pss_bytes.unwrap_or(0).max(v));
         }
+        // Instantaneous tree-wide thread + process counts at this tick.
+        // Both follow the memory-style "max of per-tick sums" semantics —
+        // they are not cumulative counters with deltas.
+        if let Some(threads) = sum_thread_count(snapshots) {
+            self.max_n_threads = Some(self.max_n_threads.unwrap_or(0).max(threads));
+        }
+        self.max_n_procs = self.max_n_procs.max(snapshots.len() as u64);
         for snap in snapshots {
             let entry = self.per_pid.entry(snap.pid).or_default();
             if let Some(io_in) = snap.io_read_bytes {
@@ -318,6 +353,7 @@ impl SamplerState {
             minor_page_faults: deltas.minor_page_faults,
             voluntary_ctx_switches: deltas.voluntary_ctx_switches,
             involuntary_ctx_switches: deltas.involuntary_ctx_switches,
+            n_threads: sum_thread_count(snapshots),
         })
     }
 
@@ -418,6 +454,8 @@ impl SamplerState {
             minor_page_faults: cum.minor_page_faults,
             voluntary_ctx_switches: cum.voluntary_ctx_switches,
             involuntary_ctx_switches: cum.involuntary_ctx_switches,
+            peak_n_threads: self.max_n_threads,
+            peak_n_procs: self.max_n_procs,
             data_collected: true,
         }
     }

@@ -135,13 +135,24 @@ fn trace_flag_writes_per_tick_tsv() {
 
     let trace_text = std::fs::read_to_string(&trace).expect("trace tsv");
     let lines: Vec<&str> = trace_text.lines().collect();
-    assert_eq!(
-        lines[0],
-        "s\trss\tvms\tuss\tpss\tio_in\tio_out\tcpu_time\tn_procs\t\
-         major_page_faults\tminor_page_faults\t\
-         voluntary_ctx_switches\tinvoluntary_ctx_switches",
-        "unexpected trace header",
-    );
+    let trace_header = lines[0];
+    // Spot-check the columns by name rather than locking the exact header
+    // string; future metric PRs append columns without re-recording here.
+    for col in [
+        "s",
+        "rss",
+        "n_procs",
+        "major_page_faults",
+        "minor_page_faults",
+        "voluntary_ctx_switches",
+        "involuntary_ctx_switches",
+        "n_threads",
+    ] {
+        assert!(
+            trace_header.split('\t').any(|c| c == col),
+            "trace header missing {col}: {trace_header}",
+        );
+    }
     assert!(
         lines.len() >= 3,
         "expected header + multiple ticks, got {}: {trace_text:?}",
@@ -515,6 +526,61 @@ fn snakemake_strict_mode_strips_ctx_switch_columns() {
     assert!(!header.contains("involuntary_ctx_switches"));
     let cols: Vec<&str> = text.lines().nth(1).unwrap().split('\t').collect();
     assert_eq!(cols.len(), 10, "strict mode row must still be 10 cols: {cols:?}");
+}
+
+/// Peak thread + process count appear in the full-mode TSV. Both platforms
+/// populate thread counts (procfs and TaskInfo); a workload with multiple
+/// processes drives `peak_n_procs` above 1.
+#[test]
+fn peak_thread_and_proc_counts_appear_in_aggregate_tsv() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("timing.tsv");
+    // Two backgrounded sleeps + a foreground sleep ⇒ at least 3 procs in
+    // the tree concurrently for ~0.3s, easily caught by interval=0.1.
+    let result =
+        run_bench(&out, "tsv", &[], &["sh", "-c", "sleep 0.3 & sleep 0.3 & sleep 0.3 ; wait"]);
+    assert!(result.status.success(), "stderr: {}", String::from_utf8_lossy(&result.stderr));
+
+    let text = std::fs::read_to_string(&out).expect("aggregate tsv");
+    let header = text.lines().next().expect("header");
+    let header_cols: Vec<&str> = header.split('\t').collect();
+    let cols: Vec<&str> = text.lines().nth(1).expect("data row").split('\t').collect();
+    assert_eq!(cols.len(), header_cols.len(), "header/row mismatch");
+
+    let pos = |name: &str| {
+        header_cols.iter().position(|c| *c == name).unwrap_or_else(|| panic!("col {name}"))
+    };
+    let peak_n_procs: u64 = cols[pos("peak_n_procs")].parse().expect("peak_n_procs parses as u64");
+    assert!(peak_n_procs >= 3, "peak_n_procs {peak_n_procs} should reflect 3 concurrent procs");
+    let peak_n_threads: u64 =
+        cols[pos("peak_n_threads")].parse().expect("peak_n_threads parses as u64");
+    assert!(peak_n_threads >= peak_n_procs, "peak_n_threads must be >= peak_n_procs");
+}
+
+#[test]
+fn snakemake_strict_mode_strips_peak_n_columns() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("timing.tsv");
+    let result = run_bench(&out, "tsv", &["--snakemake"], &["sh", "-c", "sleep 0.3"]);
+    assert!(result.status.success(), "stderr: {}", String::from_utf8_lossy(&result.stderr));
+
+    let header = std::fs::read_to_string(&out).unwrap().lines().next().unwrap().to_string();
+    assert!(!header.contains("peak_n_threads"), "strict header: {header}");
+    assert!(!header.contains("peak_n_procs"), "strict header: {header}");
+}
+
+#[test]
+fn trace_includes_n_threads_per_tick() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("timing.tsv");
+    let trace = tmp.path().join("trace.tsv");
+    let trace_str = trace.to_str().expect("utf8");
+    let result = run_bench(&out, "tsv", &["--trace", trace_str], &["sh", "-c", "sleep 0.4"]);
+    assert!(result.status.success(), "stderr: {}", String::from_utf8_lossy(&result.stderr));
+
+    let trace_text = std::fs::read_to_string(&trace).expect("trace tsv");
+    let header = trace_text.lines().next().expect("trace header");
+    assert!(header.contains("\tn_threads"), "trace header missing n_threads: {header}");
 }
 
 fn python3_available() -> bool {

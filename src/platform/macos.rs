@@ -119,6 +119,9 @@ fn sample_process(pid: i32) -> Option<ProcessSnapshot> {
     let vms_bytes = task.pti_virtual_size;
     let cpu_time_seconds =
         mach_time_to_seconds(task.pti_total_user) + mach_time_to_seconds(task.pti_total_system);
+    // `pti_threadnum` is the live thread count for the task; signed in the
+    // libproc bindings but never negative in practice.
+    let thread_count = u64::try_from(task.pti_threadnum).ok();
 
     let rusage_result: Result<RUsageInfoV4, _> = pidrusage(pid);
     let (uss_bytes, pss_bytes, io_read_bytes, io_write_bytes, major_page_faults) =
@@ -162,6 +165,7 @@ fn sample_process(pid: i32) -> Option<ProcessSnapshot> {
         // granular source we can populate them then.
         voluntary_ctx_switches: None,
         involuntary_ctx_switches: None,
+        thread_count,
     })
 }
 

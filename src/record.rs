@@ -19,7 +19,8 @@ pub const TSV_HEADER: &str =
 pub const TSV_HEADER_FULL: &str = "s\th:m:s\tmax_rss\tmax_vms\tmax_uss\tmax_pss\t\
                                    io_in\tio_out\tmean_load\tcpu_time\t\
                                    major_page_faults\tminor_page_faults\t\
-                                   voluntary_ctx_switches\tinvoluntary_ctx_switches";
+                                   voluntary_ctx_switches\tinvoluntary_ctx_switches\t\
+                                   peak_n_threads\tpeak_n_procs";
 
 /// Return the appropriate aggregate header for the requested schema mode.
 #[must_use]
@@ -35,7 +36,8 @@ pub fn tsv_header(mode: SchemaMode) -> &'static str {
 /// [`SchemaMode`] — it always includes every column.
 pub const TRACE_TSV_HEADER: &str = "s\trss\tvms\tuss\tpss\tio_in\tio_out\tcpu_time\tn_procs\t\
                                     major_page_faults\tminor_page_faults\t\
-                                    voluntary_ctx_switches\tinvoluntary_ctx_switches";
+                                    voluntary_ctx_switches\tinvoluntary_ctx_switches\t\
+                                    n_threads";
 
 /// Aggregate-output schema selector.
 ///
@@ -103,6 +105,10 @@ pub struct TickRecord {
     /// `None` if no process exposed counters this tick — always `None` on
     /// macOS.
     pub involuntary_ctx_switches: Option<u64>,
+    /// Threads currently live across the tree (sum across PIDs in this
+    /// tick). `None` if no process exposed a thread count this tick;
+    /// generally populated on both Linux and macOS.
+    pub n_threads: Option<u64>,
 }
 
 impl TickRecord {
@@ -123,6 +129,7 @@ impl TickRecord {
             self.minor_page_faults,
             self.voluntary_ctx_switches,
             self.involuntary_ctx_switches,
+            self.n_threads,
         ] {
             out.push('\t');
             out.push_str(&format_optional_u64(value));
@@ -176,6 +183,15 @@ pub struct BenchmarkRecord {
     /// Total involuntary context switches observed across the process tree
     /// (summed per-PID maximum). `None` on macOS.
     pub involuntary_ctx_switches: Option<u64>,
+    /// Peak instantaneous thread count across the tree — the max over ticks
+    /// of the summed per-PID thread counts. `None` if no process ever
+    /// exposed a thread count.
+    pub peak_n_threads: Option<u64>,
+    /// Peak instantaneous live-process count across the tree — the max over
+    /// ticks of `snapshots.len()`. Always known when `data_collected` is
+    /// true; renders as `NA` otherwise (matching the existing scalar
+    /// fields like `cpu_time`).
+    pub peak_n_procs: u64,
     /// Whether at least one sample successfully read OS resource counters.
     ///
     /// When `false` the TSV row is rendered with `NA` placeholders for every
@@ -198,8 +214,8 @@ impl BenchmarkRecord {
         write!(out, "{:.4}\t{}", self.running_time, format_hms(self.running_time)).unwrap();
 
         let extra_cols = match mode {
-            // page faults (2) + ctx switches (2)
-            SchemaMode::Full => 4,
+            // page faults (2) + ctx switches (2) + peak n_threads + n_procs
+            SchemaMode::Full => 6,
             SchemaMode::SnakemakeStrict => 0,
         };
 
@@ -223,10 +239,14 @@ impl BenchmarkRecord {
                 self.minor_page_faults,
                 self.voluntary_ctx_switches,
                 self.involuntary_ctx_switches,
+                self.peak_n_threads,
             ] {
                 out.push('\t');
                 out.push_str(&format_optional_u64(value));
             }
+            // peak_n_procs is a plain `u64`, not Option, so render bare —
+            // when `data_collected` is true it's always populated.
+            write!(out, "\t{}", self.peak_n_procs).unwrap();
         }
         out
     }
@@ -318,6 +338,11 @@ impl BenchmarkRecord {
             rows.push(("minor_page_faults", int_cell(self.minor_page_faults)));
             rows.push(("voluntary_ctx_switches", int_cell(self.voluntary_ctx_switches)));
             rows.push(("involuntary_ctx_switches", int_cell(self.involuntary_ctx_switches)));
+            rows.push(("peak_n_threads", int_cell(self.peak_n_threads)));
+            rows.push((
+                "peak_n_procs",
+                if self.data_collected { self.peak_n_procs.to_string() } else { "NA".to_string() },
+            ));
         }
         rows
     }
@@ -434,6 +459,8 @@ mod tests {
             minor_page_faults: Some(1234),
             voluntary_ctx_switches: Some(80),
             involuntary_ctx_switches: Some(7),
+            peak_n_threads: Some(13),
+            peak_n_procs: 4,
             data_collected: true,
         }
     }
@@ -449,17 +476,18 @@ mod tests {
     #[test]
     fn header_full_appends_tricord_columns() {
         assert!(TSV_HEADER_FULL.starts_with(TSV_HEADER));
-        assert!(TSV_HEADER_FULL.ends_with("\tinvoluntary_ctx_switches"));
         // No reordering of the snakemake prefix.
         let strict_cols: Vec<&str> = TSV_HEADER.split('\t').collect();
         let full_cols: Vec<&str> = TSV_HEADER_FULL.split('\t').collect();
         assert_eq!(&full_cols[..strict_cols.len()], &strict_cols[..]);
-        // All four tricord-added columns are present.
+        // Every tricord-added column lives after the snakemake prefix.
         for col in [
             "major_page_faults",
             "minor_page_faults",
             "voluntary_ctx_switches",
             "involuntary_ctx_switches",
+            "peak_n_threads",
+            "peak_n_procs",
         ] {
             assert!(full_cols.contains(&col), "missing {col} in {TSV_HEADER_FULL}");
         }
@@ -520,10 +548,12 @@ mod tests {
 
     #[test]
     fn tsv_row_full_mode_appends_all_tricord_columns() {
+        // full_record(): page faults 42/1234, ctx switches 80/7, peak
+        // threads 13, peak procs 4.
         assert_eq!(
             full_record().to_tsv_row(SchemaMode::Full),
             "12.3456\t0:00:12\t101.50\t2048.00\t95.20\t96.00\t1.25\t0.50\t175.00\t21.60\t\
-             42\t1234\t80\t7",
+             42\t1234\t80\t7\t13\t4",
         );
     }
 
@@ -538,18 +568,18 @@ mod tests {
 
     #[test]
     fn tsv_row_full_mode_renders_missing_tricord_metrics_as_dash() {
+        // Option-typed tricord metrics render as `-` when None; the plain
+        // `peak_n_procs: u64` renders as its bare integer (full_record's 4).
         let record = BenchmarkRecord {
             major_page_faults: None,
             minor_page_faults: None,
             voluntary_ctx_switches: None,
             involuntary_ctx_switches: None,
+            peak_n_threads: None,
             ..full_record()
         };
-        assert!(
-            record.to_tsv_row(SchemaMode::Full).ends_with("\t-\t-\t-\t-"),
-            "row was: {}",
-            record.to_tsv_row(SchemaMode::Full),
-        );
+        let row = record.to_tsv_row(SchemaMode::Full);
+        assert!(row.ends_with("\t-\t-\t-\t-\t-\t4"), "row was: {row}");
     }
 
     #[test]
@@ -601,7 +631,8 @@ mod tests {
             TRACE_TSV_HEADER,
             "s\trss\tvms\tuss\tpss\tio_in\tio_out\tcpu_time\tn_procs\t\
              major_page_faults\tminor_page_faults\t\
-             voluntary_ctx_switches\tinvoluntary_ctx_switches"
+             voluntary_ctx_switches\tinvoluntary_ctx_switches\t\
+             n_threads"
         );
     }
 
@@ -621,10 +652,11 @@ mod tests {
             minor_page_faults: Some(150),
             voluntary_ctx_switches: Some(11),
             involuntary_ctx_switches: Some(3),
+            n_threads: Some(8),
         };
         assert_eq!(
             tick.to_tsv_row(),
-            "0.5012\t102.30\t2048.00\t95.20\t96.00\t1.25\t0.50\t0.75\t3\t2\t150\t11\t3"
+            "0.5012\t102.30\t2048.00\t95.20\t96.00\t1.25\t0.50\t0.75\t3\t2\t150\t11\t3\t8"
         );
     }
 
@@ -644,15 +676,16 @@ mod tests {
             minor_page_faults: None,
             voluntary_ctx_switches: None,
             involuntary_ctx_switches: None,
+            n_threads: None,
         };
-        assert_eq!(tick.to_tsv_row(), "1.0000\t10.00\t20.00\t-\t-\t-\t-\t0.00\t1\t-\t-\t-\t-");
+        assert_eq!(tick.to_tsv_row(), "1.0000\t10.00\t20.00\t-\t-\t-\t-\t0.00\t1\t-\t-\t-\t-\t-");
     }
 
     #[test]
     fn markdown_full_data_exact_layout() {
-        // Widest label is now "involuntary_ctx_switches" (24 chars), driving
-        // the metric column width. Value widths are still 7 ("12.3456" /
-        // "2048.00" / "0:00:12") — the new int values are shorter.
+        // Widest label is still "involuntary_ctx_switches" (24 chars); the
+        // PR 3 additions ("peak_n_threads", "peak_n_procs") are shorter,
+        // so column widths don't shift. Two new rows at the bottom.
         //
         // When new metrics land (tracking issue #11 on fg-labs/tricord), this
         // golden block needs re-recording — both for the new rows and for any
@@ -674,6 +707,8 @@ mod tests {
 | minor_page_faults        |    1234 |
 | voluntary_ctx_switches   |      80 |
 | involuntary_ctx_switches |       7 |
+| peak_n_threads           |      13 |
+| peak_n_procs             |       4 |
 ";
         assert_eq!(full_record().to_markdown_document(SchemaMode::Full), expected);
     }
@@ -730,6 +765,8 @@ mod tests {
             minor_page_faults: None,
             voluntary_ctx_switches: None,
             involuntary_ctx_switches: None,
+            peak_n_threads: None,
+            peak_n_procs: 1,
             data_collected: true,
         };
         let doc = record.to_markdown_document(SchemaMode::Full);
@@ -741,6 +778,7 @@ mod tests {
             "minor_page_faults",
             "voluntary_ctx_switches",
             "involuntary_ctx_switches",
+            "peak_n_threads",
         ] {
             let row = doc.lines().find(|l| l.contains(metric)).expect("metric row");
             assert!(row.contains(" - "), "expected dash in {metric} row: {row}");

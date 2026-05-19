@@ -106,8 +106,8 @@ Snakemake schema; the prefix's column order and value formatting are
 identical in both modes.
 
 ```text
-s	h:m:s	max_rss	max_vms	max_uss	max_pss	io_in	io_out	mean_load	cpu_time	major_page_faults	minor_page_faults	voluntary_ctx_switches	involuntary_ctx_switches
-12.3456	0:00:12	101.50	2048.00	95.20	96.00	1.25	0.50	175.00	21.60	42	1234	80	7
+s	h:m:s	max_rss	max_vms	max_uss	max_pss	io_in	io_out	mean_load	cpu_time	major_page_faults	minor_page_faults	voluntary_ctx_switches	involuntary_ctx_switches	peak_n_threads	peak_n_procs
+12.3456	0:00:12	101.50	2048.00	95.20	96.00	1.25	0.50	175.00	21.60	42	1234	80	7	13	4
 ```
 
 | Column | Units | Meaning |
@@ -126,6 +126,8 @@ s	h:m:s	max_rss	max_vms	max_uss	max_pss	io_in	io_out	mean_load	cpu_time	major_pa
 | `minor_page_faults` | integer | Total minor page faults across the tree. `tricord`-added; omitted under `--snakemake`. Always `-` on macOS — see [Platform notes](#platform-notes). |
 | `voluntary_ctx_switches` | integer | Total voluntary context switches across the tree (processes yielding the CPU on their own — typically waiting on I/O or a sleep). `tricord`-added; omitted under `--snakemake`. Always `-` on macOS. |
 | `involuntary_ctx_switches` | integer | Total involuntary context switches across the tree (processes preempted by the scheduler). `tricord`-added; omitted under `--snakemake`. Always `-` on macOS. |
+| `peak_n_threads` | integer | Peak instantaneous thread count across the tree — max over sampling ticks of the summed per-process thread counts. `tricord`-added; omitted under `--snakemake`. |
+| `peak_n_procs` | integer | Peak instantaneous live-process count across the tree — max over sampling ticks of how many processes were observed. Catches "I asked for 16 workers but the tool spawned 200." `tricord`-added; omitted under `--snakemake`. |
 
 Missing values render as `-`; if the run was too short for any sample to
 succeed, every resource column is `NA`.
@@ -137,10 +139,10 @@ per sampling tick — useful for "did it spike or stay flat?" plots and for
 post-mortem on OOM kills. The aggregate `--out` file is unaffected.
 
 ```text
-s	rss	vms	uss	pss	io_in	io_out	cpu_time	n_procs	major_page_faults	minor_page_faults	voluntary_ctx_switches	involuntary_ctx_switches
-0.5012	102.30	2048.00	95.20	96.00	1.25	0.50	0.75	3	0	850	12	1
-1.0027	120.45	2048.00	112.10	113.00	2.50	1.00	1.55	3	2	1200	28	3
-1.5042	101.50	2048.00	95.20	96.00	2.50	1.00	2.40	2	0	340	15	0
+s	rss	vms	uss	pss	io_in	io_out	cpu_time	n_procs	major_page_faults	minor_page_faults	voluntary_ctx_switches	involuntary_ctx_switches	n_threads
+0.5012	102.30	2048.00	95.20	96.00	1.25	0.50	0.75	3	0	850	12	1	5
+1.0027	120.45	2048.00	112.10	113.00	2.50	1.00	1.55	3	2	1200	28	3	7
+1.5042	101.50	2048.00	95.20	96.00	2.50	1.00	2.40	2	0	340	15	0	4
 ```
 
 | Column | Units | Meaning |
@@ -152,6 +154,7 @@ s	rss	vms	uss	pss	io_in	io_out	cpu_time	n_procs	major_page_faults	minor_page_fau
 | `n_procs` | integer | Number of live processes in this tick |
 | `major_page_faults`, `minor_page_faults` | integer | Page faults that occurred *during this tick* (per-tick delta, summed across observed PIDs). Minor is always `-` on macOS. |
 | `voluntary_ctx_switches`, `involuntary_ctx_switches` | integer | Context switches that occurred *during this tick* (per-tick delta, summed across observed PIDs). Both are always `-` on macOS. |
+| `n_threads` | integer | Live thread count across the tree at this tick (sum across PIDs). Instantaneous, not cumulative. |
 
 Memory columns are instantaneous, so they can go up *or down* between rows;
 I/O, CPU, and the page-fault deltas describe activity within the tick — they
@@ -163,7 +166,7 @@ The trace is `tricord`-native and is **not** affected by `--snakemake`.
 Default (full) mode includes `tricord`-added fields:
 
 ```json
-{"running_time":12.3456,"max_rss":101.5,"max_vms":2048.0,"max_uss":95.2,"max_pss":96.0,"io_in":1.25,"io_out":0.5,"mean_load":175.0,"cpu_time":21.6,"major_page_faults":42,"minor_page_faults":1234,"voluntary_ctx_switches":80,"involuntary_ctx_switches":7,"data_collected":true}
+{"running_time":12.3456,"max_rss":101.5,"max_vms":2048.0,"max_uss":95.2,"max_pss":96.0,"io_in":1.25,"io_out":0.5,"mean_load":175.0,"cpu_time":21.6,"major_page_faults":42,"minor_page_faults":1234,"voluntary_ctx_switches":80,"involuntary_ctx_switches":7,"peak_n_threads":13,"peak_n_procs":4,"data_collected":true}
 ```
 
 Under `--snakemake` the `tricord`-added keys are *absent* from the object
@@ -220,6 +223,7 @@ macOS implementation uses [`libproc`]'s `proc_pidinfo` and `proc_pid_rusage`
 | `major_page_faults` | `/proc/<pid>/stat` (majflt) | `proc_pid_rusage::ri_pageins` |
 | `minor_page_faults` | `/proc/<pid>/stat` (minflt) | not exposed — column is `-` |
 | `voluntary_ctx_switches`, `involuntary_ctx_switches` | `/proc/<pid>/status` (`voluntary_ctxt_switches`, `nonvoluntary_ctxt_switches`) | not split by `proc_pid_rusage` — both columns are `-` |
+| `peak_n_threads`, `n_threads` | `/proc/<pid>/status` (`threads`) | `proc_taskinfo::pti_threadnum` |
 
 ### macOS PSS approximation
 
