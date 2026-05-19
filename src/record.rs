@@ -20,7 +20,8 @@ pub const TSV_HEADER_FULL: &str = "s\th:m:s\tmax_rss\tmax_vms\tmax_uss\tmax_pss\
                                    io_in\tio_out\tmean_load\tcpu_time\t\
                                    major_page_faults\tminor_page_faults\t\
                                    voluntary_ctx_switches\tinvoluntary_ctx_switches\t\
-                                   peak_n_threads\tpeak_n_procs";
+                                   peak_n_threads\tpeak_n_procs\t\
+                                   loadavg_1m_start\tloadavg_1m_end";
 
 /// Return the appropriate aggregate header for the requested schema mode.
 #[must_use]
@@ -192,6 +193,15 @@ pub struct BenchmarkRecord {
     /// true; renders as `NA` otherwise (matching the existing scalar
     /// fields like `cpu_time`).
     pub peak_n_procs: u64,
+    /// System 1-minute load average sampled just before `tricord` started
+    /// the child. `None` if the platform read failed.
+    pub loadavg_1m_start: Option<f64>,
+    /// System 1-minute load average sampled just after the child exited.
+    /// `None` if the platform read failed. Pairing start + end frames the
+    /// rest of the numbers: a peak `cpu_time` of 800 % on an idle host
+    /// (loadavg ~1) means something very different from the same peak on
+    /// a thrashing host (loadavg 30).
+    pub loadavg_1m_end: Option<f64>,
     /// Whether at least one sample successfully read OS resource counters.
     ///
     /// When `false` the TSV row is rendered with `NA` placeholders for every
@@ -215,7 +225,8 @@ impl BenchmarkRecord {
 
         let extra_cols = match mode {
             // page faults (2) + ctx switches (2) + peak n_threads + n_procs
-            SchemaMode::Full => 6,
+            // + loadavg start/end (2) = 8
+            SchemaMode::Full => 8,
             SchemaMode::SnakemakeStrict => 0,
         };
 
@@ -247,6 +258,10 @@ impl BenchmarkRecord {
             // peak_n_procs is a plain `u64`, not Option, so render bare —
             // when `data_collected` is true it's always populated.
             write!(out, "\t{}", self.peak_n_procs).unwrap();
+            for value in [self.loadavg_1m_start, self.loadavg_1m_end] {
+                out.push('\t');
+                out.push_str(&format_optional_float(value));
+            }
         }
         out
     }
@@ -343,6 +358,8 @@ impl BenchmarkRecord {
                 "peak_n_procs",
                 if self.data_collected { self.peak_n_procs.to_string() } else { "NA".to_string() },
             ));
+            rows.push(("loadavg_1m_start", cell(self.loadavg_1m_start)));
+            rows.push(("loadavg_1m_end", cell(self.loadavg_1m_end)));
         }
         rows
     }
@@ -461,6 +478,8 @@ mod tests {
             involuntary_ctx_switches: Some(7),
             peak_n_threads: Some(13),
             peak_n_procs: 4,
+            loadavg_1m_start: Some(0.50),
+            loadavg_1m_end: Some(2.25),
             data_collected: true,
         }
     }
@@ -549,11 +568,11 @@ mod tests {
     #[test]
     fn tsv_row_full_mode_appends_all_tricord_columns() {
         // full_record(): page faults 42/1234, ctx switches 80/7, peak
-        // threads 13, peak procs 4.
+        // threads 13, peak procs 4, loadavg 0.50 → 2.25.
         assert_eq!(
             full_record().to_tsv_row(SchemaMode::Full),
             "12.3456\t0:00:12\t101.50\t2048.00\t95.20\t96.00\t1.25\t0.50\t175.00\t21.60\t\
-             42\t1234\t80\t7\t13\t4",
+             42\t1234\t80\t7\t13\t4\t0.50\t2.25",
         );
     }
 
@@ -570,16 +589,19 @@ mod tests {
     fn tsv_row_full_mode_renders_missing_tricord_metrics_as_dash() {
         // Option-typed tricord metrics render as `-` when None; the plain
         // `peak_n_procs: u64` renders as its bare integer (full_record's 4).
+        // Loadavg fields are Option<f64>, also render as `-`.
         let record = BenchmarkRecord {
             major_page_faults: None,
             minor_page_faults: None,
             voluntary_ctx_switches: None,
             involuntary_ctx_switches: None,
             peak_n_threads: None,
+            loadavg_1m_start: None,
+            loadavg_1m_end: None,
             ..full_record()
         };
         let row = record.to_tsv_row(SchemaMode::Full);
-        assert!(row.ends_with("\t-\t-\t-\t-\t-\t4"), "row was: {row}");
+        assert!(row.ends_with("\t-\t-\t-\t-\t-\t4\t-\t-"), "row was: {row}");
     }
 
     #[test]
@@ -683,9 +705,9 @@ mod tests {
 
     #[test]
     fn markdown_full_data_exact_layout() {
-        // Widest label is still "involuntary_ctx_switches" (24 chars); the
-        // PR 3 additions ("peak_n_threads", "peak_n_procs") are shorter,
-        // so column widths don't shift. Two new rows at the bottom.
+        // Widest label is still "involuntary_ctx_switches" (24 chars); PR 4
+        // adds "loadavg_1m_start"/"loadavg_1m_end" (16 chars) — narrower,
+        // so widths don't shift. Two new rows at the bottom.
         //
         // When new metrics land (tracking issue #11 on fg-labs/tricord), this
         // golden block needs re-recording — both for the new rows and for any
@@ -709,6 +731,8 @@ mod tests {
 | involuntary_ctx_switches |       7 |
 | peak_n_threads           |      13 |
 | peak_n_procs             |       4 |
+| loadavg_1m_start         |    0.50 |
+| loadavg_1m_end           |    2.25 |
 ";
         assert_eq!(full_record().to_markdown_document(SchemaMode::Full), expected);
     }
@@ -767,6 +791,8 @@ mod tests {
             involuntary_ctx_switches: None,
             peak_n_threads: None,
             peak_n_procs: 1,
+            loadavg_1m_start: None,
+            loadavg_1m_end: None,
             data_collected: true,
         };
         let doc = record.to_markdown_document(SchemaMode::Full);
@@ -779,6 +805,8 @@ mod tests {
             "voluntary_ctx_switches",
             "involuntary_ctx_switches",
             "peak_n_threads",
+            "loadavg_1m_start",
+            "loadavg_1m_end",
         ] {
             let row = doc.lines().find(|l| l.contains(metric)).expect("metric row");
             assert!(row.contains(" - "), "expected dash in {metric} row: {row}");

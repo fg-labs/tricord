@@ -10,6 +10,7 @@ use std::{
 
 use crate::{
     format::{self, OutputFormat},
+    platform,
     record::{BenchmarkRecord, SchemaMode},
     sampler::{SamplerHandle, SamplerOptions},
     signals::SignalForwarder,
@@ -88,13 +89,20 @@ pub fn run_command(command: &str, args: &[String], options: &RunOptions) -> io::
     // Install signal forwarding before the sampler so a fast Ctrl-C still
     // reaches the child even if the sampler thread hasn't started yet.
     let signals = SignalForwarder::install(child_pid)?;
+    // Snapshot system loadavg just before the sampler starts so the
+    // "start" value reflects load entering the run (before our child has
+    // had time to contribute meaningfully to the EMA).
+    let loadavg_start = platform::read_loadavg_1m();
     let sampler = SamplerHandle::spawn(
         child_pid,
         SamplerOptions { interval: options.interval, trace_path: options.trace_path.clone() },
     );
 
     let status = child.wait()?;
-    let record = sampler.stop();
+    let mut record = sampler.stop();
+    let loadavg_end = platform::read_loadavg_1m();
+    record.loadavg_1m_start = loadavg_start;
+    record.loadavg_1m_end = loadavg_end;
     drop(signals);
 
     format::write_to_path(&record, &options.output_path, options.format, options.schema_mode)?;

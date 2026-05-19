@@ -123,6 +123,8 @@ mod tests {
             involuntary_ctx_switches: Some(5),
             peak_n_threads: Some(6),
             peak_n_procs: 2,
+            loadavg_1m_start: Some(0.75),
+            loadavg_1m_end: Some(1.10),
             data_collected: true,
         }
     }
@@ -136,11 +138,12 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert!(lines[0].contains("\tmajor_page_faults\tminor_page_faults\t"));
         assert!(lines[0].contains("\tvoluntary_ctx_switches\tinvoluntary_ctx_switches\t"));
-        assert!(lines[0].contains("\tpeak_n_threads\tpeak_n_procs"));
+        assert!(lines[0].contains("\tpeak_n_threads\tpeak_n_procs\t"));
+        assert!(lines[0].contains("\tloadavg_1m_start\tloadavg_1m_end"));
         assert!(lines[1].starts_with("0.5000\t"));
         // sample_record(): major=3 minor=120 voluntary=40 involuntary=5
-        //                  peak_n_threads=6 peak_n_procs=2
-        assert!(lines[1].ends_with("\t3\t120\t40\t5\t6\t2"), "data row: {}", lines[1]);
+        //                  peak_n_threads=6 peak_n_procs=2 loadavg 0.75 → 1.10
+        assert!(lines[1].ends_with("\t3\t120\t40\t5\t6\t2\t0.75\t1.10"), "data row: {}", lines[1]);
         assert!(text.ends_with('\n'));
     }
 

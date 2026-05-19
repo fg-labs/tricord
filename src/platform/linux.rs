@@ -112,6 +112,15 @@ fn sample_process(pid: i32, ticks_per_second: f64) -> Option<ProcessSnapshot> {
     })
 }
 
+/// Read the first whitespace-separated field of `/proc/loadavg` — the
+/// kernel's exponentially-weighted 1-minute load average. Returns `None`
+/// if the file is missing or unparseable.
+#[must_use]
+pub fn read_loadavg_1m() -> Option<f64> {
+    let text = std::fs::read_to_string("/proc/loadavg").ok()?;
+    text.split_whitespace().next()?.parse::<f64>().ok()
+}
+
 /// Parse `/proc/<pid>/smaps_rollup` for USS and PSS. Returns `(None, None)` if
 /// the file cannot be read (older kernels, restricted access).
 fn read_smaps_rollup(proc: &Process) -> (Option<u64>, Option<u64>) {
