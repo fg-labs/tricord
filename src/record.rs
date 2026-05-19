@@ -147,6 +147,54 @@ impl BenchmarkRecord {
         serde_json::to_string(self)
     }
 
+    /// Render this record as a Markdown table (two columns: `metric | value`).
+    ///
+    /// Uses the same column order and value formatting as `to_tsv_row` and
+    /// `TSV_HEADER`: `%.4f` for `s`, `%.2f` for floats, `-` for missing
+    /// optional values, and `NA` across all resource cells when
+    /// `data_collected == false`. Column widths auto-fit the longest cell so
+    /// the table stays compact in pasted PR/issue output.
+    #[must_use]
+    pub fn to_markdown_document(&self) -> String {
+        let rows = self.markdown_rows();
+        let metric_w = rows.iter().map(|(m, _)| m.len()).max().unwrap_or(0).max("metric".len());
+        let value_w = rows.iter().map(|(_, v)| v.len()).max().unwrap_or(0).max("value".len());
+
+        let mut out = String::with_capacity(256);
+        writeln!(out, "| {:<metric_w$} | {:>value_w$} |", "metric", "value").unwrap();
+        writeln!(out, "|:{}|{}:|", "-".repeat(metric_w + 1), "-".repeat(value_w + 1)).unwrap();
+        for (metric, value) in &rows {
+            writeln!(out, "| {metric:<metric_w$} | {value:>value_w$} |").unwrap();
+        }
+        out
+    }
+
+    /// Build the ordered `(metric_label, value_string)` pairs that drive the
+    /// Markdown table. The list lives here as a single authoritative column
+    /// order for the Markdown formatter; `to_tsv_row` keeps its own
+    /// independent implementation, so both must be updated together when new
+    /// metrics land.
+    fn markdown_rows(&self) -> Vec<(&'static str, String)> {
+        let cell = |value: Option<f64>| {
+            if self.data_collected { format_optional_float(value) } else { "NA".to_string() }
+        };
+        let scalar = |value: f64| {
+            if self.data_collected { format!("{value:.2}") } else { "NA".to_string() }
+        };
+        vec![
+            ("s", format!("{:.4}", self.running_time)),
+            ("h:m:s", format_hms(self.running_time)),
+            ("max_rss", cell(self.max_rss)),
+            ("max_vms", cell(self.max_vms)),
+            ("max_uss", cell(self.max_uss)),
+            ("max_pss", cell(self.max_pss)),
+            ("io_in", cell(self.io_in)),
+            ("io_out", cell(self.io_out)),
+            ("mean_load", scalar(self.mean_load)),
+            ("cpu_time", scalar(self.cpu_time)),
+        ]
+    }
+
     /// Pretty one-line summary suitable for printing to stderr after a run.
     #[must_use]
     pub fn summary_line(&self) -> String {
@@ -321,6 +369,105 @@ mod tests {
             n_procs: 1,
         };
         assert_eq!(tick.to_tsv_row(), "1.0000\t10.00\t20.00\t-\t-\t-\t-\t0.00\t1");
+    }
+
+    #[test]
+    fn markdown_full_data_exact_layout() {
+        let record = BenchmarkRecord {
+            running_time: 12.3456,
+            max_rss: Some(101.5),
+            max_vms: Some(2048.0),
+            max_uss: Some(95.2),
+            max_pss: Some(96.0),
+            io_in: Some(1.25),
+            io_out: Some(0.5),
+            mean_load: 175.0,
+            cpu_time: 21.6,
+            data_collected: true,
+        };
+        // metric_w = 9 (longest is "mean_load"), value_w = 7 (longest is
+        // "12.3456" / "2048.00" / "0:00:12"). Values right-align so numbers
+        // line up visually; metric labels left-align.
+        //
+        // When new metrics land (tracking issue #11 on fg-labs/tricord), this
+        // golden block needs re-recording — both for the new rows and for any
+        // width shift if a new label is longer than `mean_load`.
+        let expected = "\
+| metric    |   value |
+|:----------|--------:|
+| s         | 12.3456 |
+| h:m:s     | 0:00:12 |
+| max_rss   |  101.50 |
+| max_vms   | 2048.00 |
+| max_uss   |   95.20 |
+| max_pss   |   96.00 |
+| io_in     |    1.25 |
+| io_out    |    0.50 |
+| mean_load |  175.00 |
+| cpu_time  |   21.60 |
+";
+        assert_eq!(record.to_markdown_document(), expected);
+    }
+
+    #[test]
+    fn markdown_no_data_uses_na_in_resource_cells() {
+        let record =
+            BenchmarkRecord { running_time: 0.1234, data_collected: false, ..Default::default() };
+        let doc = record.to_markdown_document();
+        // s and h:m:s are always populated; every resource row shows NA.
+        assert!(doc.contains("| s         |  0.1234 |"), "doc was: {doc}");
+        assert!(doc.contains("| h:m:s     | 0:00:00 |"), "doc was: {doc}");
+        for metric in
+            ["max_rss", "max_vms", "max_uss", "max_pss", "io_in", "io_out", "mean_load", "cpu_time"]
+        {
+            let row = doc
+                .lines()
+                .find(|l| l.contains(metric))
+                .unwrap_or_else(|| panic!("no row for {metric}"));
+            assert!(row.ends_with("|      NA |"), "row for {metric}: {row}");
+        }
+    }
+
+    #[test]
+    fn markdown_missing_optionals_render_as_dash() {
+        let record = BenchmarkRecord {
+            running_time: 1.0,
+            max_rss: Some(10.0),
+            max_vms: Some(20.0),
+            max_uss: Some(8.0),
+            max_pss: None,
+            io_in: None,
+            io_out: None,
+            mean_load: 0.0,
+            cpu_time: 0.0,
+            data_collected: true,
+        };
+        let doc = record.to_markdown_document();
+        // Each None value renders as a bare `-`, just like in the TSV.
+        for metric in ["max_pss", "io_in", "io_out"] {
+            let row = doc.lines().find(|l| l.contains(metric)).expect("metric row");
+            assert!(row.contains(" - "), "expected dash in {metric} row: {row}");
+        }
+    }
+
+    #[test]
+    fn markdown_document_starts_with_header_and_alignment_row() {
+        let record =
+            BenchmarkRecord { running_time: 0.5, data_collected: false, ..Default::default() };
+        let doc = record.to_markdown_document();
+        let mut lines = doc.lines();
+        let header = lines.next().expect("header line");
+        let sep = lines.next().expect("separator line");
+        assert!(header.starts_with("| metric"), "header was: {header}");
+        assert!(header.contains("value"), "header was: {header}");
+        // Alignment row: left colon under metric, right colon under value.
+        assert!(sep.starts_with("|:"), "separator was: {sep}");
+        assert!(sep.ends_with(":|"), "separator was: {sep}");
+        // header + alignment row + one data row per TSV column. Derived from
+        // TSV_HEADER so issue #11's metric additions auto-update the count.
+        let expected_rows = 2 + TSV_HEADER.split('\t').count();
+        assert_eq!(doc.lines().count(), expected_rows);
+        assert!(doc.ends_with('\n'));
     }
 
     #[test]

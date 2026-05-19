@@ -26,6 +26,7 @@ fn main() -> ExitCode {
         format: args.format.into(),
         force_summary: args.summary,
         trace_path: args.trace.clone().map(PathBuf::into_boxed_path),
+        markdown_path: args.export_markdown.clone().map(PathBuf::into_boxed_path),
     };
 
     match run_command(&command, &command_args, &options) {

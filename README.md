@@ -37,6 +37,9 @@ both spreadsheets and pipelines.
 - **Optional per-tick trace** (`--trace <PATH>`) — one TSV row per sample, so
   you can see how memory, I/O, and CPU evolved during the run instead of just
   the final aggregate.
+- **Optional Markdown export** (`--export-markdown <PATH>`) — renders the
+  aggregate record as a two-column Markdown table, ready to paste into PR
+  descriptions, issue comments, and design docs.
 - **Clean shutdown** — forwards `SIGINT` / `SIGTERM` / `SIGHUP` to the
   child's process group so orchestrators can tear runs down without
   leaking children.
@@ -76,6 +79,9 @@ Options:
       --interval <SECONDS>   Sampling interval [default: 0.5]
       --summary              Print one-line summary to stderr after the run
       --trace <PATH>         Also write a per-tick TSV trace to this path
+      --export-markdown <PATH>
+                             Also write a Markdown table of the aggregate
+                             record to this path
   -v, --verbose...           Increase log level (-v, -vv, -vvv)
   -h, --help                 Print help
   -V, --version              Print version
@@ -142,6 +148,30 @@ I/O and CPU are cumulative, so they are monotonically non-decreasing.
 
 Same fields, raw numeric types, `null` for missing.
 
+### Markdown (`--export-markdown <PATH>`)
+
+When `--export-markdown` is given, `tricorder` writes a two-column Markdown
+table of the aggregate record to that path, alongside the primary `--out`
+file. Designed for pasting into PR descriptions, issue comments, and design
+docs — for the per-tick trace, keep using `--trace`.
+
+```markdown
+| metric    |   value |
+|:----------|--------:|
+| s         | 12.3456 |
+| h:m:s     | 0:00:12 |
+| max_rss   |  101.50 |
+| max_vms   | 2048.00 |
+| max_uss   |   95.20 |
+| max_pss   |   96.00 |
+| io_in     |    1.25 |
+| io_out    |    0.50 |
+| mean_load |  175.00 |
+| cpu_time  |   21.60 |
+```
+
+Same column order, value formatting, and `-` / `NA` rules as the TSV.
+
 ## Platform notes
 
 `tricord` runs on **Linux** and **macOS**. The Linux implementation reads
@@ -198,6 +228,7 @@ let options = RunOptions {
     format: OutputFormat::Tsv,
     force_summary: false,
     trace_path: None,
+    markdown_path: None,
 };
 let outcome = run_command("samtools", &["sort".into(), "in.bam".into()], &options).unwrap();
 println!("exit={} cpu_time={:.2}s", outcome.exit_code(), outcome.record.cpu_time);

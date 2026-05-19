@@ -79,6 +79,23 @@ pub fn write_to<W: Write>(
     }
 }
 
+/// Serialize `record` as a Markdown table to `path`. Creates parent
+/// directories if needed; overwrites existing files.
+///
+/// Lives alongside [`write_to_path`] but takes no `OutputFormat`: Markdown is
+/// a sidecar output (`--export-markdown`) that can be requested alongside the
+/// primary `--out`/`--format` file, not a third value of `--format`.
+///
+/// # Errors
+/// Returns any I/O error from the file system.
+pub fn write_markdown_to_path(record: &BenchmarkRecord, path: &Path) -> io::Result<()> {
+    ensure_parent_dir(path)?;
+    let file = File::create(path)?;
+    let mut writer = BufWriter::new(file);
+    writer.write_all(record.to_markdown_document().as_bytes())?;
+    writer.flush()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,5 +144,19 @@ mod tests {
         write_to_path(&sample_record(), &path, OutputFormat::Tsv).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.starts_with("s\th:m:s"));
+    }
+
+    #[test]
+    fn write_markdown_to_path_emits_table_and_creates_parents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("nested/deeper/timing.md");
+        write_markdown_to_path(&sample_record(), &path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut lines = text.lines();
+        assert!(lines.next().is_some_and(|line| line.starts_with("| metric")));
+        assert!(lines.next().is_some_and(|line| line.starts_with("|:")));
+        // Spot-check one well-known row from the sample record (s = 0.5).
+        assert!(text.contains("| s "), "missing s row in: {text}");
+        assert!(text.ends_with('\n'));
     }
 }

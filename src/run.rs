@@ -47,6 +47,10 @@ pub struct RunOptions {
     pub force_summary: bool,
     /// Optional path for a per-tick TSV trace. `None` disables the trace.
     pub trace_path: Option<Box<Path>>,
+    /// Optional path for an additional Markdown table of the aggregate
+    /// record (`--export-markdown`). `None` disables it. Written alongside
+    /// `output_path`, not in place of it.
+    pub markdown_path: Option<Box<Path>>,
 }
 
 /// Spawn `command` (with `args`), benchmark its process tree, and write the
@@ -61,6 +65,11 @@ pub struct RunOptions {
 /// output file. Errors from the child itself surface as a non-zero
 /// [`RunOutcome::exit_code`], not as an `Err`.
 pub fn run_command(command: &str, args: &[String], options: &RunOptions) -> io::Result<RunOutcome> {
+    // Reject distinct flags pointing at the same path *before* spawning
+    // anything — otherwise the second writer silently clobbers the first
+    // and the user loses data with no warning.
+    validate_output_paths(options)?;
+
     let mut cmd = Command::new(command);
     cmd.args(args);
     cmd.stdin(Stdio::inherit());
@@ -85,12 +94,53 @@ pub fn run_command(command: &str, args: &[String], options: &RunOptions) -> io::
     drop(signals);
 
     format::write_to_path(&record, &options.output_path, options.format)?;
+    if let Some(path) = options.markdown_path.as_deref() {
+        format::write_markdown_to_path(&record, path)?;
+    }
 
     if options.force_summary || io::stderr().is_terminal() {
         eprintln!("tricorder: {}", record.summary_line());
     }
 
     Ok(RunOutcome { record, status })
+}
+
+/// Reject any pair of output flags (`--out`, `--trace`, `--export-markdown`)
+/// that resolves to the same on-disk path. Distinct flags must produce
+/// distinct files; otherwise the writers race each other and the user
+/// silently loses one of the outputs.
+///
+/// Paths are compared by their `Path` value as supplied — no canonicalization,
+/// so trailing-slash quirks or `./` prefixes still distinguish files that
+/// would otherwise hit the same inode. The check is intentionally
+/// pessimistic: false positives are user-visible and recoverable
+/// (change a flag), false negatives lose data.
+fn validate_output_paths(options: &RunOptions) -> io::Result<()> {
+    let mut configured: Vec<(&'static str, &Path)> = Vec::with_capacity(3);
+    configured.push(("--out", &options.output_path));
+    if let Some(p) = options.trace_path.as_deref() {
+        configured.push(("--trace", p));
+    }
+    if let Some(p) = options.markdown_path.as_deref() {
+        configured.push(("--export-markdown", p));
+    }
+    for i in 0..configured.len() {
+        for j in (i + 1)..configured.len() {
+            let (flag_a, path_a) = configured[i];
+            let (flag_b, path_b) = configured[j];
+            if path_a == path_b {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "{flag_a} and {flag_b} point to the same path ({}); \
+                         each output flag must use a distinct path",
+                        path_a.display(),
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// POSIX-style exit code derivation: child's `code()` if it exited normally,
@@ -121,5 +171,54 @@ mod tests {
     fn exit_code_signal_uses_128_plus_signum() {
         let status = ExitStatus::from_raw(15); // SIGTERM with no core dump
         assert_eq!(exit_code_for(status), 128 + 15);
+    }
+
+    fn options_with(out: &str, trace: Option<&str>, markdown: Option<&str>) -> RunOptions {
+        RunOptions {
+            interval: Duration::from_millis(100),
+            output_path: Path::new(out).into(),
+            format: OutputFormat::Tsv,
+            force_summary: false,
+            trace_path: trace.map(|p| Path::new(p).into()),
+            markdown_path: markdown.map(|p| Path::new(p).into()),
+        }
+    }
+
+    #[test]
+    fn validate_output_paths_accepts_all_distinct() {
+        let opts = options_with("/tmp/a.tsv", Some("/tmp/b.tsv"), Some("/tmp/c.md"));
+        validate_output_paths(&opts).expect("distinct paths are fine");
+    }
+
+    #[test]
+    fn validate_output_paths_accepts_when_sidecars_absent() {
+        let opts = options_with("/tmp/a.tsv", None, None);
+        validate_output_paths(&opts).expect("single path can't collide with itself");
+    }
+
+    #[test]
+    fn validate_output_paths_rejects_out_equals_markdown() {
+        let opts = options_with("/tmp/shared.tsv", None, Some("/tmp/shared.tsv"));
+        let err = validate_output_paths(&opts).expect_err("must reject collision");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        let msg = err.to_string();
+        assert!(msg.contains("--out") && msg.contains("--export-markdown"), "msg: {msg}");
+        assert!(msg.contains("/tmp/shared.tsv"), "msg: {msg}");
+    }
+
+    #[test]
+    fn validate_output_paths_rejects_trace_equals_markdown() {
+        let opts = options_with("/tmp/agg.tsv", Some("/tmp/shared.tsv"), Some("/tmp/shared.tsv"));
+        let err = validate_output_paths(&opts).expect_err("must reject collision");
+        let msg = err.to_string();
+        assert!(msg.contains("--trace") && msg.contains("--export-markdown"), "msg: {msg}");
+    }
+
+    #[test]
+    fn validate_output_paths_rejects_out_equals_trace() {
+        let opts = options_with("/tmp/shared.tsv", Some("/tmp/shared.tsv"), None);
+        let err = validate_output_paths(&opts).expect_err("must reject collision");
+        let msg = err.to_string();
+        assert!(msg.contains("--out") && msg.contains("--trace"), "msg: {msg}");
     }
 }
