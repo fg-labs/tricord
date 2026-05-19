@@ -33,6 +33,21 @@ struct MachTimebaseInfo {
 
 unsafe extern "C" {
     fn mach_timebase_info(info: *mut MachTimebaseInfo) -> i32;
+    /// `getloadavg(double[] loadavg, int nelem)` — fills the first `nelem`
+    /// slots with the 1/5/15-minute kernel load averages, returns the
+    /// number actually written (or -1 on error). Stable BSD API.
+    fn getloadavg(loadavg: *mut f64, nelem: i32) -> i32;
+}
+
+/// Read the system 1-minute load average via `getloadavg(3)`. Returns
+/// `None` on error (which shouldn't happen on any supported macOS).
+#[must_use]
+pub fn read_loadavg_1m() -> Option<f64> {
+    let mut buf = [0.0_f64; 1];
+    // SAFETY: getloadavg writes at most `nelem` doubles to the buffer.
+    // We pass 1 and an exactly-1-element buffer.
+    let written = unsafe { getloadavg(buf.as_mut_ptr(), 1) };
+    if written < 1 { None } else { Some(buf[0]) }
 }
 
 /// `(numer, denom)` from `mach_timebase_info`, cached once per process.

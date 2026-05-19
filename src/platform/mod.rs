@@ -37,3 +37,21 @@ pub fn new_sampler() -> Box<dyn ProcessSampler> {
         compile_error!("tricord supports Linux and macOS only");
     }
 }
+
+/// Read the system 1-minute load average, in "tasks ready to run" units.
+///
+/// Returns `None` if the platform read fails. Used by `run_command` to
+/// snapshot system context at run start and end — the value frames the
+/// per-process numbers ("peak CPU 800 % on an idle box vs the same peak
+/// on a thrashing host").
+#[must_use]
+pub fn read_loadavg_1m() -> Option<f64> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::read_loadavg_1m()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos::read_loadavg_1m()
+    }
+}

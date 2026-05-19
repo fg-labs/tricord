@@ -583,6 +583,62 @@ fn trace_includes_n_threads_per_tick() {
     assert!(header.contains("\tn_threads"), "trace header missing n_threads: {header}");
 }
 
+/// System 1-minute load average is sampled at start and end of the run
+/// and added as two aggregate columns. Trace TSV is intentionally not
+/// touched — loadavg is already a moving average so per-tick samples
+/// would mostly be noise on the same kernel-side smoothing.
+#[test]
+fn loadavg_start_and_end_appear_in_aggregate_tsv() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("timing.tsv");
+    let result = run_bench(&out, "tsv", &[], &["sh", "-c", "sleep 0.3"]);
+    assert!(result.status.success(), "stderr: {}", String::from_utf8_lossy(&result.stderr));
+
+    let text = std::fs::read_to_string(&out).expect("aggregate tsv");
+    let header = text.lines().next().expect("header");
+    let header_cols: Vec<&str> = header.split('\t').collect();
+    let cols: Vec<&str> = text.lines().nth(1).expect("data row").split('\t').collect();
+    let pos = |name: &str| {
+        header_cols.iter().position(|c| *c == name).unwrap_or_else(|| panic!("col {name}"))
+    };
+    let start: f64 =
+        cols[pos("loadavg_1m_start")].parse().expect("loadavg_1m_start parses as float");
+    let end: f64 = cols[pos("loadavg_1m_end")].parse().expect("loadavg_1m_end parses as float");
+    // Loadavg is non-negative; on idle laptops it can be near zero, so >= 0 is
+    // the safe lower bound. Upper bound is generous to absorb any contention.
+    assert!(start >= 0.0, "loadavg_1m_start {start} must be >= 0");
+    assert!(end >= 0.0, "loadavg_1m_end {end} must be >= 0");
+    assert!(start < 10_000.0 && end < 10_000.0, "loadavg unexpectedly huge");
+}
+
+#[test]
+fn snakemake_strict_mode_strips_loadavg_columns() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("timing.tsv");
+    let result = run_bench(&out, "tsv", &["--snakemake"], &["sh", "-c", "sleep 0.3"]);
+    assert!(result.status.success(), "stderr: {}", String::from_utf8_lossy(&result.stderr));
+
+    let header = std::fs::read_to_string(&out).unwrap().lines().next().unwrap().to_string();
+    assert!(!header.contains("loadavg_1m_start"), "strict header: {header}");
+    assert!(!header.contains("loadavg_1m_end"), "strict header: {header}");
+}
+
+#[test]
+fn loadavg_is_not_added_to_trace_columns() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("timing.tsv");
+    let trace = tmp.path().join("trace.tsv");
+    let trace_str = trace.to_str().unwrap();
+    let result = run_bench(&out, "tsv", &["--trace", trace_str], &["sh", "-c", "sleep 0.4"]);
+    assert!(result.status.success(), "stderr: {}", String::from_utf8_lossy(&result.stderr));
+
+    let trace_header = std::fs::read_to_string(&trace).unwrap().lines().next().unwrap().to_string();
+    assert!(
+        !trace_header.contains("loadavg"),
+        "trace TSV must not include loadavg (it's already a smoothed avg): {trace_header}",
+    );
+}
+
 fn python3_available() -> bool {
     Command::new("python3").arg("--version").output().is_ok_and(|o| o.status.success())
 }
