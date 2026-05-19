@@ -49,6 +49,15 @@ pub struct Args {
     #[arg(long, value_name = "PATH")]
     pub export_markdown: Option<PathBuf>,
 
+    /// Emit only the original Snakemake aggregate schema. By default,
+    /// `tricord` appends extra columns (page faults, …) on top of the 10
+    /// Snakemake columns; `--snakemake` strips those additions from every
+    /// aggregate-record output (TSV, JSON, and Markdown). The per-tick
+    /// `--trace` file is *not* affected — the trace is `tricord`-native and
+    /// always includes every column.
+    #[arg(long)]
+    pub snakemake: bool,
+
     /// Verbosity (each `-v` raises the log level: warn → info → debug → trace).
     #[arg(short, long, action = clap::ArgAction::Count)]
     pub verbose: u8,
@@ -182,6 +191,18 @@ mod tests {
     fn export_markdown_defaults_to_none() {
         let args = Args::parse_from(["tricorder", "--out", "out.tsv", "--", "true"]);
         assert!(args.export_markdown.is_none());
+    }
+
+    #[test]
+    fn snakemake_flag_defaults_to_false() {
+        let args = Args::parse_from(["tricorder", "--out", "out.tsv", "--", "true"]);
+        assert!(!args.snakemake);
+    }
+
+    #[test]
+    fn snakemake_flag_set_to_true() {
+        let args = Args::parse_from(["tricorder", "--out", "out.tsv", "--snakemake", "--", "true"]);
+        assert!(args.snakemake);
     }
 
     #[test]

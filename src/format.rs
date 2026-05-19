@@ -6,7 +6,7 @@ use std::{
     path::Path,
 };
 
-use crate::record::BenchmarkRecord;
+use crate::record::{BenchmarkRecord, SchemaMode};
 
 /// One of the supported on-disk output formats.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,8 +28,8 @@ impl OutputFormat {
     }
 }
 
-/// Serialize `record` to `path` in the requested format. Creates parent
-/// directories if needed; overwrites existing files.
+/// Serialize `record` to `path` in the requested format and schema mode.
+/// Creates parent directories if needed; overwrites existing files.
 ///
 /// # Errors
 /// Returns any I/O error from the file system or serialization layer.
@@ -37,11 +37,12 @@ pub fn write_to_path(
     record: &BenchmarkRecord,
     path: &Path,
     format: OutputFormat,
+    mode: SchemaMode,
 ) -> io::Result<()> {
     ensure_parent_dir(path)?;
     let file = File::create(path)?;
     let mut writer = BufWriter::new(file);
-    write_to(record, &mut writer, format)?;
+    write_to(record, &mut writer, format, mode)?;
     // Surface flush errors instead of letting BufWriter::drop swallow them.
     writer.flush()
 }
@@ -68,11 +69,12 @@ pub fn write_to<W: Write>(
     record: &BenchmarkRecord,
     writer: &mut W,
     format: OutputFormat,
+    mode: SchemaMode,
 ) -> io::Result<()> {
     match format {
-        OutputFormat::Tsv => writer.write_all(record.to_tsv_document().as_bytes()),
+        OutputFormat::Tsv => writer.write_all(record.to_tsv_document(mode).as_bytes()),
         OutputFormat::Json => {
-            let json = record.to_json().map_err(io::Error::other)?;
+            let json = record.to_json(mode).map_err(io::Error::other)?;
             writer.write_all(json.as_bytes())?;
             writer.write_all(b"\n")
         }
@@ -88,11 +90,15 @@ pub fn write_to<W: Write>(
 ///
 /// # Errors
 /// Returns any I/O error from the file system.
-pub fn write_markdown_to_path(record: &BenchmarkRecord, path: &Path) -> io::Result<()> {
+pub fn write_markdown_to_path(
+    record: &BenchmarkRecord,
+    path: &Path,
+    mode: SchemaMode,
+) -> io::Result<()> {
     ensure_parent_dir(path)?;
     let file = File::create(path)?;
     let mut writer = BufWriter::new(file);
-    writer.write_all(record.to_markdown_document().as_bytes())?;
+    writer.write_all(record.to_markdown_document(mode).as_bytes())?;
     writer.flush()
 }
 
@@ -111,37 +117,66 @@ mod tests {
             io_out: Some(0.25),
             mean_load: 100.0,
             cpu_time: 0.5,
+            major_page_faults: Some(3),
+            minor_page_faults: Some(120),
             data_collected: true,
         }
     }
 
     #[test]
-    fn tsv_writer_emits_header_and_data_row() {
+    fn tsv_writer_full_mode_emits_full_header_and_data_row() {
         let mut buf = Vec::new();
-        write_to(&sample_record(), &mut buf, OutputFormat::Tsv).unwrap();
+        write_to(&sample_record(), &mut buf, OutputFormat::Tsv, SchemaMode::Full).unwrap();
         let text = std::str::from_utf8(&buf).unwrap();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 2);
-        assert!(lines[0].starts_with("s\th:m:s\t"));
+        assert!(lines[0].ends_with("\tmajor_page_faults\tminor_page_faults"));
         assert!(lines[1].starts_with("0.5000\t"));
+        assert!(lines[1].ends_with("\t3\t120"), "data row: {}", lines[1]);
         assert!(text.ends_with('\n'));
     }
 
     #[test]
-    fn json_writer_emits_one_object_per_line() {
+    fn tsv_writer_strict_mode_emits_snakemake_header() {
         let mut buf = Vec::new();
-        write_to(&sample_record(), &mut buf, OutputFormat::Json).unwrap();
+        write_to(&sample_record(), &mut buf, OutputFormat::Tsv, SchemaMode::SnakemakeStrict)
+            .unwrap();
+        let text = std::str::from_utf8(&buf).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], crate::record::TSV_HEADER);
+        // Data row has exactly 10 tab-separated columns.
+        assert_eq!(lines[1].split('\t').count(), 10);
+    }
+
+    #[test]
+    fn json_writer_full_mode_includes_tricord_fields() {
+        let mut buf = Vec::new();
+        write_to(&sample_record(), &mut buf, OutputFormat::Json, SchemaMode::Full).unwrap();
         let text = std::str::from_utf8(&buf).unwrap().trim_end();
         let value: serde_json::Value = serde_json::from_str(text).unwrap();
         assert!(value.is_object());
         assert_eq!(value["data_collected"], true);
+        assert_eq!(value["major_page_faults"], 3);
+        assert_eq!(value["minor_page_faults"], 120);
+    }
+
+    #[test]
+    fn json_writer_strict_mode_omits_tricord_fields() {
+        let mut buf = Vec::new();
+        write_to(&sample_record(), &mut buf, OutputFormat::Json, SchemaMode::SnakemakeStrict)
+            .unwrap();
+        let text = std::str::from_utf8(&buf).unwrap().trim_end();
+        let value: serde_json::Value = serde_json::from_str(text).unwrap();
+        let obj = value.as_object().unwrap();
+        assert!(!obj.contains_key("major_page_faults"));
+        assert!(!obj.contains_key("minor_page_faults"));
     }
 
     #[test]
     fn write_to_path_creates_parent_directories() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("nested/deeper/timing.tsv");
-        write_to_path(&sample_record(), &path, OutputFormat::Tsv).unwrap();
+        write_to_path(&sample_record(), &path, OutputFormat::Tsv, SchemaMode::Full).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.starts_with("s\th:m:s"));
     }
@@ -150,13 +185,22 @@ mod tests {
     fn write_markdown_to_path_emits_table_and_creates_parents() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("nested/deeper/timing.md");
-        write_markdown_to_path(&sample_record(), &path).unwrap();
+        write_markdown_to_path(&sample_record(), &path, SchemaMode::Full).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         let mut lines = text.lines();
         assert!(lines.next().is_some_and(|line| line.starts_with("| metric")));
         assert!(lines.next().is_some_and(|line| line.starts_with("|:")));
-        // Spot-check one well-known row from the sample record (s = 0.5).
-        assert!(text.contains("| s "), "missing s row in: {text}");
+        // Spot-check the page-fault row added in full mode.
+        assert!(text.contains("major_page_faults"), "missing page-fault row in: {text}");
         assert!(text.ends_with('\n'));
+    }
+
+    #[test]
+    fn write_markdown_to_path_strict_omits_page_faults() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("timing.md");
+        write_markdown_to_path(&sample_record(), &path, SchemaMode::SnakemakeStrict).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("major_page_faults"));
     }
 }

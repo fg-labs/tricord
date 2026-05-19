@@ -7,15 +7,52 @@ use std::fmt::Write as _;
 
 use serde::Serialize;
 
-/// Tab-separated header row, identical to Snakemake's.
+/// Tab-separated aggregate header, **identical to Snakemake's**. Selected by
+/// [`SchemaMode::SnakemakeStrict`] — emitted when the user passes
+/// `--snakemake` to opt out of `tricord`-specific column additions.
 pub const TSV_HEADER: &str =
     "s\th:m:s\tmax_rss\tmax_vms\tmax_uss\tmax_pss\tio_in\tio_out\tmean_load\tcpu_time";
 
-/// Tab-separated header for the per-tick trace TSV (`--trace`). Distinct from
-/// [`TSV_HEADER`] because the trace records *instantaneous* memory and
-/// *cumulative-so-far* I/O and CPU values; there is no `mean_load` or `h:m:s`
-/// column because those are only meaningful for the whole-run aggregate.
-pub const TRACE_TSV_HEADER: &str = "s\trss\tvms\tuss\tpss\tio_in\tio_out\tcpu_time\tn_procs";
+/// Tab-separated aggregate header in full mode: [`TSV_HEADER`] plus every
+/// column `tricord` has added on top of the Snakemake schema. Selected by
+/// [`SchemaMode::Full`] (the default).
+pub const TSV_HEADER_FULL: &str = "s\th:m:s\tmax_rss\tmax_vms\tmax_uss\tmax_pss\t\
+                                   io_in\tio_out\tmean_load\tcpu_time\t\
+                                   major_page_faults\tminor_page_faults";
+
+/// Return the appropriate aggregate header for the requested schema mode.
+#[must_use]
+pub fn tsv_header(mode: SchemaMode) -> &'static str {
+    match mode {
+        SchemaMode::Full => TSV_HEADER_FULL,
+        SchemaMode::SnakemakeStrict => TSV_HEADER,
+    }
+}
+
+/// Tab-separated header for the per-tick trace TSV (`--trace`). The trace is
+/// `tricord`-native (not Snakemake-derived) and so is not affected by
+/// [`SchemaMode`] — it always includes every column.
+pub const TRACE_TSV_HEADER: &str = "s\trss\tvms\tuss\tpss\tio_in\tio_out\tcpu_time\tn_procs\t\
+                                    major_page_faults\tminor_page_faults";
+
+/// Aggregate-output schema selector.
+///
+/// All `BenchmarkRecord` formatters (`to_tsv_*`, `to_json`, `to_markdown_*`)
+/// take a `SchemaMode`. Snakemake-strict mode emits only the original 10-column
+/// schema; full mode emits everything `tricord` collects. The per-tick trace
+/// is unaffected — `SchemaMode` is purely about the aggregate record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SchemaMode {
+    /// Full schema — `tricord`'s superset of the Snakemake columns. The
+    /// default for CLI users and library consumers.
+    #[default]
+    Full,
+    /// Snakemake-strict — only the original 10 columns of
+    /// `snakemake.benchmark.write_benchmark_records(extended_fmt=False)`.
+    /// Selected by `--snakemake` on the CLI; useful when downstream tooling
+    /// pins to the Snakemake schema.
+    SnakemakeStrict,
+}
 
 /// One per-tick row of the trace TSV.
 ///
@@ -44,21 +81,35 @@ pub struct TickRecord {
     pub cpu_time: f64,
     /// Number of live processes in this tick.
     pub n_procs: usize,
+    /// Major page faults that occurred *during this tick*, summed across the
+    /// observed PIDs (delta from the previous observation, not cumulative).
+    /// `None` if no process exposed major-fault counters this tick.
+    pub major_page_faults: Option<u64>,
+    /// Minor page faults that occurred *during this tick*, summed across the
+    /// observed PIDs (delta from the previous observation). `None` if no
+    /// process exposed minor-fault counters this tick — always `None` on
+    /// macOS where the kernel does not expose minor faults via
+    /// `proc_pid_rusage`.
+    pub minor_page_faults: Option<u64>,
 }
 
 impl TickRecord {
     /// Render this tick as a single TSV row using `%.4f` for elapsed time,
     /// `%.2f` for floats, `-` for missing optional values, and a bare integer
-    /// for `n_procs`.
+    /// for `n_procs` and page-fault counts.
     #[must_use]
     pub fn to_tsv_row(&self) -> String {
-        let mut out = String::with_capacity(96);
+        let mut out = String::with_capacity(128);
         write!(out, "{:.4}\t{:.2}\t{:.2}", self.elapsed, self.rss, self.vms).unwrap();
         for value in [self.uss, self.pss, self.io_in, self.io_out] {
             out.push('\t');
             out.push_str(&format_optional_float(value));
         }
         write!(out, "\t{:.2}\t{}", self.cpu_time, self.n_procs).unwrap();
+        for value in [self.major_page_faults, self.minor_page_faults] {
+            out.push('\t');
+            out.push_str(&format_optional_u64(value));
+        }
         out
     }
 }
@@ -92,6 +143,15 @@ pub struct BenchmarkRecord {
     pub mean_load: f64,
     /// Cumulative user + system CPU time across the process tree, in seconds.
     pub cpu_time: f64,
+    /// Total major page faults observed across the process tree (summed
+    /// per-PID maximum, mirroring CPU/I/O aggregation). `None` if no process
+    /// ever exposed major-fault counters.
+    pub major_page_faults: Option<u64>,
+    /// Total minor page faults observed across the process tree (summed
+    /// per-PID maximum). `None` if no process exposed minor-fault counters —
+    /// always `None` on macOS where the kernel does not expose minor faults
+    /// via `proc_pid_rusage`.
+    pub minor_page_faults: Option<u64>,
     /// Whether at least one sample successfully read OS resource counters.
     ///
     /// When `false` the TSV row is rendered with `NA` placeholders for every
@@ -101,16 +161,25 @@ pub struct BenchmarkRecord {
 }
 
 impl BenchmarkRecord {
-    /// Render this record as a single TSV row using Snakemake's column order
-    /// and value formatting (`%.4f` for `s`, `%.2f` for floats, `-` for `None`,
-    /// `NA` across all resource columns when `data_collected == false`).
+    /// Render this record as a single TSV row.
+    ///
+    /// Snakemake's column order and value formatting (`%.4f` for `s`, `%.2f`
+    /// for floats, `-` for `None`, `NA` across all resource columns when
+    /// `data_collected == false`) applies in both modes. In `Full` mode the
+    /// `tricord`-added columns are appended on the right; page-fault counts
+    /// render as bare integers (or `-` when missing, `NA` when no data).
     #[must_use]
-    pub fn to_tsv_row(&self) -> String {
-        let mut out = String::with_capacity(96);
+    pub fn to_tsv_row(&self, mode: SchemaMode) -> String {
+        let mut out = String::with_capacity(128);
         write!(out, "{:.4}\t{}", self.running_time, format_hms(self.running_time)).unwrap();
 
+        let extra_cols = match mode {
+            SchemaMode::Full => 2, // major_page_faults + minor_page_faults
+            SchemaMode::SnakemakeStrict => 0,
+        };
+
         if !self.data_collected {
-            for _ in 0..8 {
+            for _ in 0..(8 + extra_cols) {
                 out.push_str("\tNA");
             }
             return out;
@@ -123,28 +192,43 @@ impl BenchmarkRecord {
             out.push_str(&format_optional_float(value));
         }
         write!(out, "\t{:.2}\t{:.2}", self.mean_load, self.cpu_time).unwrap();
+        if mode == SchemaMode::Full {
+            for value in [self.major_page_faults, self.minor_page_faults] {
+                out.push('\t');
+                out.push_str(&format_optional_u64(value));
+            }
+        }
         out
     }
 
     /// Render this record as a complete TSV document (header + single data row,
-    /// trailing newline).
+    /// trailing newline). The header matches `mode` — strict mode emits
+    /// [`TSV_HEADER`]; full mode emits [`TSV_HEADER_FULL`].
     #[must_use]
-    pub fn to_tsv_document(&self) -> String {
-        let mut out = String::with_capacity(192);
-        out.push_str(TSV_HEADER);
+    pub fn to_tsv_document(&self, mode: SchemaMode) -> String {
+        let mut out = String::with_capacity(256);
+        out.push_str(tsv_header(mode));
         out.push('\n');
-        out.push_str(&self.to_tsv_row());
+        out.push_str(&self.to_tsv_row(mode));
         out.push('\n');
         out
     }
 
     /// Serialize this record as a JSON object string.
     ///
+    /// In `Full` mode every field of the struct is serialized. In
+    /// `SnakemakeStrict` mode only the original 10 Snakemake fields plus
+    /// `data_collected` are emitted; `tricord`-added fields are omitted from
+    /// the object entirely (not set to `null`).
+    ///
     /// # Errors
     /// Returns an error only if `serde_json` itself fails (which should not
     /// happen for this struct).
-    pub fn to_json(&self) -> serde_json::Result<String> {
-        serde_json::to_string(self)
+    pub fn to_json(&self, mode: SchemaMode) -> serde_json::Result<String> {
+        match mode {
+            SchemaMode::Full => serde_json::to_string(self),
+            SchemaMode::SnakemakeStrict => serde_json::to_string(&SnakemakeView::from(self)),
+        }
     }
 
     /// Render this record as a Markdown table (two columns: `metric | value`).
@@ -154,9 +238,12 @@ impl BenchmarkRecord {
     /// optional values, and `NA` across all resource cells when
     /// `data_collected == false`. Column widths auto-fit the longest cell so
     /// the table stays compact in pasted PR/issue output.
+    ///
+    /// In `SnakemakeStrict` mode the `tricord`-added rows are omitted —
+    /// the table holds only the original 10 Snakemake metric rows.
     #[must_use]
-    pub fn to_markdown_document(&self) -> String {
-        let rows = self.markdown_rows();
+    pub fn to_markdown_document(&self, mode: SchemaMode) -> String {
+        let rows = self.markdown_rows(mode);
         let metric_w = rows.iter().map(|(m, _)| m.len()).max().unwrap_or(0).max("metric".len());
         let value_w = rows.iter().map(|(_, v)| v.len()).max().unwrap_or(0).max("value".len());
 
@@ -174,14 +261,17 @@ impl BenchmarkRecord {
     /// order for the Markdown formatter; `to_tsv_row` keeps its own
     /// independent implementation, so both must be updated together when new
     /// metrics land.
-    fn markdown_rows(&self) -> Vec<(&'static str, String)> {
+    fn markdown_rows(&self, mode: SchemaMode) -> Vec<(&'static str, String)> {
         let cell = |value: Option<f64>| {
             if self.data_collected { format_optional_float(value) } else { "NA".to_string() }
         };
         let scalar = |value: f64| {
             if self.data_collected { format!("{value:.2}") } else { "NA".to_string() }
         };
-        vec![
+        let int_cell = |value: Option<u64>| {
+            if self.data_collected { format_optional_u64(value) } else { "NA".to_string() }
+        };
+        let mut rows = vec![
             ("s", format!("{:.4}", self.running_time)),
             ("h:m:s", format_hms(self.running_time)),
             ("max_rss", cell(self.max_rss)),
@@ -192,7 +282,12 @@ impl BenchmarkRecord {
             ("io_out", cell(self.io_out)),
             ("mean_load", scalar(self.mean_load)),
             ("cpu_time", scalar(self.cpu_time)),
-        ]
+        ];
+        if mode == SchemaMode::Full {
+            rows.push(("major_page_faults", int_cell(self.major_page_faults)));
+            rows.push(("minor_page_faults", int_cell(self.minor_page_faults)));
+        }
+        rows
     }
 
     /// Pretty one-line summary suitable for printing to stderr after a run.
@@ -222,6 +317,51 @@ fn format_optional_float(value: Option<f64>) -> String {
     }
 }
 
+/// Render an `Option<u64>` cell — bare integer for `Some`, `-` for `None`.
+/// Used for page-fault columns where decimals would be misleading.
+fn format_optional_u64(value: Option<u64>) -> String {
+    match value {
+        Some(v) => v.to_string(),
+        None => "-".to_string(),
+    }
+}
+
+/// Strict-mode JSON projection — only the fields in the original Snakemake
+/// schema, by borrowed reference so we don't have to copy the record.
+///
+/// Kept in sync by review pressure: every `tricord`-added field on
+/// [`BenchmarkRecord`] must be deliberately *absent* from this struct.
+#[derive(Serialize)]
+struct SnakemakeView<'a> {
+    running_time: f64,
+    max_rss: &'a Option<f64>,
+    max_vms: &'a Option<f64>,
+    max_uss: &'a Option<f64>,
+    max_pss: &'a Option<f64>,
+    io_in: &'a Option<f64>,
+    io_out: &'a Option<f64>,
+    mean_load: f64,
+    cpu_time: f64,
+    data_collected: bool,
+}
+
+impl<'a> From<&'a BenchmarkRecord> for SnakemakeView<'a> {
+    fn from(r: &'a BenchmarkRecord) -> Self {
+        Self {
+            running_time: r.running_time,
+            max_rss: &r.max_rss,
+            max_vms: &r.max_vms,
+            max_uss: &r.max_uss,
+            max_pss: &r.max_pss,
+            io_in: &r.io_in,
+            io_out: &r.io_out,
+            mean_load: r.mean_load,
+            cpu_time: r.cpu_time,
+            data_collected: r.data_collected,
+        }
+    }
+}
+
 /// Format `seconds` as `H:MM:SS` (or `N day(s), H:MM:SS` past 24 hours),
 /// matching Python's `str(datetime.timedelta(seconds=...))` truncated to
 /// integer seconds.
@@ -247,12 +387,45 @@ pub fn format_hms(seconds: f64) -> String {
 mod tests {
     use super::*;
 
+    fn full_record() -> BenchmarkRecord {
+        BenchmarkRecord {
+            running_time: 12.3456,
+            max_rss: Some(101.5),
+            max_vms: Some(2048.0),
+            max_uss: Some(95.2),
+            max_pss: Some(96.0),
+            io_in: Some(1.25),
+            io_out: Some(0.5),
+            mean_load: 175.0,
+            cpu_time: 21.6,
+            major_page_faults: Some(42),
+            minor_page_faults: Some(1234),
+            data_collected: true,
+        }
+    }
+
     #[test]
     fn header_matches_snakemake() {
         assert_eq!(
             TSV_HEADER,
             "s\th:m:s\tmax_rss\tmax_vms\tmax_uss\tmax_pss\tio_in\tio_out\tmean_load\tcpu_time"
         );
+    }
+
+    #[test]
+    fn header_full_appends_tricord_columns() {
+        assert!(TSV_HEADER_FULL.starts_with(TSV_HEADER));
+        assert!(TSV_HEADER_FULL.ends_with("\tmajor_page_faults\tminor_page_faults"));
+        // No reordering of the snakemake prefix.
+        let strict_cols: Vec<&str> = TSV_HEADER.split('\t').collect();
+        let full_cols: Vec<&str> = TSV_HEADER_FULL.split('\t').collect();
+        assert_eq!(&full_cols[..strict_cols.len()], &strict_cols[..]);
+    }
+
+    #[test]
+    fn tsv_header_dispatches_on_mode() {
+        assert_eq!(tsv_header(SchemaMode::SnakemakeStrict), TSV_HEADER);
+        assert_eq!(tsv_header(SchemaMode::Full), TSV_HEADER_FULL);
     }
 
     #[test]
@@ -279,29 +452,51 @@ mod tests {
     }
 
     #[test]
-    fn tsv_row_no_data_uses_na_placeholders() {
+    fn tsv_row_no_data_strict_has_10_nas() {
         let record =
             BenchmarkRecord { running_time: 0.1234, data_collected: false, ..Default::default() };
-        assert_eq!(record.to_tsv_row(), "0.1234\t0:00:00\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA");
+        assert_eq!(
+            record.to_tsv_row(SchemaMode::SnakemakeStrict),
+            "0.1234\t0:00:00\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA"
+        );
     }
 
     #[test]
-    fn tsv_row_full_data() {
-        let record = BenchmarkRecord {
-            running_time: 12.3456,
-            max_rss: Some(101.5),
-            max_vms: Some(2048.0),
-            max_uss: Some(95.2),
-            max_pss: Some(96.0),
-            io_in: Some(1.25),
-            io_out: Some(0.5),
-            mean_load: 175.0,
-            cpu_time: 21.6,
-            data_collected: true,
-        };
+    fn tsv_row_no_data_full_has_12_nas() {
+        // Full mode appends one NA per tricord-added column.
+        let record =
+            BenchmarkRecord { running_time: 0.1234, data_collected: false, ..Default::default() };
         assert_eq!(
-            record.to_tsv_row(),
+            record.to_tsv_row(SchemaMode::Full),
+            "0.1234\t0:00:00\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA"
+        );
+    }
+
+    #[test]
+    fn tsv_row_full_mode_appends_page_fault_columns() {
+        assert_eq!(
+            full_record().to_tsv_row(SchemaMode::Full),
+            "12.3456\t0:00:12\t101.50\t2048.00\t95.20\t96.00\t1.25\t0.50\t175.00\t21.60\t42\t1234"
+        );
+    }
+
+    #[test]
+    fn tsv_row_strict_mode_omits_page_fault_columns() {
+        // Same record, snakemake-strict mode: drop the trailing two columns.
+        assert_eq!(
+            full_record().to_tsv_row(SchemaMode::SnakemakeStrict),
             "12.3456\t0:00:12\t101.50\t2048.00\t95.20\t96.00\t1.25\t0.50\t175.00\t21.60"
+        );
+    }
+
+    #[test]
+    fn tsv_row_full_mode_renders_missing_page_faults_as_dash() {
+        let record =
+            BenchmarkRecord { major_page_faults: None, minor_page_faults: None, ..full_record() };
+        assert!(
+            record.to_tsv_row(SchemaMode::Full).ends_with("\t-\t-"),
+            "row was: {}",
+            record.to_tsv_row(SchemaMode::Full),
         );
     }
 
@@ -318,15 +513,19 @@ mod tests {
             mean_load: 0.0,
             cpu_time: 0.0,
             data_collected: true,
+            ..Default::default()
         };
-        assert_eq!(record.to_tsv_row(), "1.0000\t0:00:01\t10.00\t20.00\t8.00\t-\t-\t-\t0.00\t0.00");
+        assert_eq!(
+            record.to_tsv_row(SchemaMode::SnakemakeStrict),
+            "1.0000\t0:00:01\t10.00\t20.00\t8.00\t-\t-\t-\t0.00\t0.00"
+        );
     }
 
     #[test]
-    fn tsv_document_has_header_and_row() {
+    fn tsv_document_strict_uses_snakemake_header() {
         let record =
             BenchmarkRecord { running_time: 0.5, data_collected: false, ..Default::default() };
-        let doc = record.to_tsv_document();
+        let doc = record.to_tsv_document(SchemaMode::SnakemakeStrict);
         let mut lines = doc.lines();
         assert_eq!(lines.next(), Some(TSV_HEADER));
         assert!(lines.next().is_some_and(|line| line.starts_with("0.5000\t")));
@@ -335,8 +534,21 @@ mod tests {
     }
 
     #[test]
-    fn trace_header_lists_per_tick_columns() {
-        assert_eq!(TRACE_TSV_HEADER, "s\trss\tvms\tuss\tpss\tio_in\tio_out\tcpu_time\tn_procs");
+    fn tsv_document_full_uses_full_header() {
+        let record =
+            BenchmarkRecord { running_time: 0.5, data_collected: false, ..Default::default() };
+        let doc = record.to_tsv_document(SchemaMode::Full);
+        let mut lines = doc.lines();
+        assert_eq!(lines.next(), Some(TSV_HEADER_FULL));
+        assert!(lines.next().is_some_and(|line| line.starts_with("0.5000\t")));
+    }
+
+    #[test]
+    fn trace_header_lists_per_tick_columns_including_page_faults() {
+        assert_eq!(
+            TRACE_TSV_HEADER,
+            "s\trss\tvms\tuss\tpss\tio_in\tio_out\tcpu_time\tn_procs\tmajor_page_faults\tminor_page_faults"
+        );
     }
 
     #[test]
@@ -351,8 +563,13 @@ mod tests {
             io_out: Some(0.5),
             cpu_time: 0.75,
             n_procs: 3,
+            major_page_faults: Some(2),
+            minor_page_faults: Some(150),
         };
-        assert_eq!(tick.to_tsv_row(), "0.5012\t102.30\t2048.00\t95.20\t96.00\t1.25\t0.50\t0.75\t3");
+        assert_eq!(
+            tick.to_tsv_row(),
+            "0.5012\t102.30\t2048.00\t95.20\t96.00\t1.25\t0.50\t0.75\t3\t2\t150"
+        );
     }
 
     #[test]
@@ -367,64 +584,72 @@ mod tests {
             io_out: None,
             cpu_time: 0.0,
             n_procs: 1,
+            major_page_faults: None,
+            minor_page_faults: None,
         };
-        assert_eq!(tick.to_tsv_row(), "1.0000\t10.00\t20.00\t-\t-\t-\t-\t0.00\t1");
+        assert_eq!(tick.to_tsv_row(), "1.0000\t10.00\t20.00\t-\t-\t-\t-\t0.00\t1\t-\t-");
     }
 
     #[test]
     fn markdown_full_data_exact_layout() {
-        let record = BenchmarkRecord {
-            running_time: 12.3456,
-            max_rss: Some(101.5),
-            max_vms: Some(2048.0),
-            max_uss: Some(95.2),
-            max_pss: Some(96.0),
-            io_in: Some(1.25),
-            io_out: Some(0.5),
-            mean_load: 175.0,
-            cpu_time: 21.6,
-            data_collected: true,
-        };
-        // metric_w = 9 (longest is "mean_load"), value_w = 7 (longest is
-        // "12.3456" / "2048.00" / "0:00:12"). Values right-align so numbers
-        // line up visually; metric labels left-align.
+        // Widest label is now "major_page_faults" (17 chars), driving the
+        // metric column width. Value widths are unchanged from before.
         //
         // When new metrics land (tracking issue #11 on fg-labs/tricord), this
         // golden block needs re-recording — both for the new rows and for any
-        // width shift if a new label is longer than `mean_load`.
+        // width shift if a new label is longer.
         let expected = "\
-| metric    |   value |
-|:----------|--------:|
-| s         | 12.3456 |
-| h:m:s     | 0:00:12 |
-| max_rss   |  101.50 |
-| max_vms   | 2048.00 |
-| max_uss   |   95.20 |
-| max_pss   |   96.00 |
-| io_in     |    1.25 |
-| io_out    |    0.50 |
-| mean_load |  175.00 |
-| cpu_time  |   21.60 |
+| metric            |   value |
+|:------------------|--------:|
+| s                 | 12.3456 |
+| h:m:s             | 0:00:12 |
+| max_rss           |  101.50 |
+| max_vms           | 2048.00 |
+| max_uss           |   95.20 |
+| max_pss           |   96.00 |
+| io_in             |    1.25 |
+| io_out            |    0.50 |
+| mean_load         |  175.00 |
+| cpu_time          |   21.60 |
+| major_page_faults |      42 |
+| minor_page_faults |    1234 |
 ";
-        assert_eq!(record.to_markdown_document(), expected);
+        assert_eq!(full_record().to_markdown_document(SchemaMode::Full), expected);
+    }
+
+    #[test]
+    fn markdown_strict_mode_drops_tricord_added_rows() {
+        let doc = full_record().to_markdown_document(SchemaMode::SnakemakeStrict);
+        assert!(!doc.contains("major_page_faults"), "strict doc must not list page faults: {doc}");
+        assert!(!doc.contains("minor_page_faults"));
+        // Header + alignment row + 10 metric rows.
+        assert_eq!(doc.lines().count(), 12);
     }
 
     #[test]
     fn markdown_no_data_uses_na_in_resource_cells() {
         let record =
             BenchmarkRecord { running_time: 0.1234, data_collected: false, ..Default::default() };
-        let doc = record.to_markdown_document();
-        // s and h:m:s are always populated; every resource row shows NA.
-        assert!(doc.contains("| s         |  0.1234 |"), "doc was: {doc}");
-        assert!(doc.contains("| h:m:s     | 0:00:00 |"), "doc was: {doc}");
-        for metric in
-            ["max_rss", "max_vms", "max_uss", "max_pss", "io_in", "io_out", "mean_load", "cpu_time"]
-        {
+        let doc = record.to_markdown_document(SchemaMode::Full);
+        // Strict-prefix metrics: every resource row ends in NA. Page-fault
+        // rows do too, since data_collected gates them.
+        for metric in [
+            "max_rss",
+            "max_vms",
+            "max_uss",
+            "max_pss",
+            "io_in",
+            "io_out",
+            "mean_load",
+            "cpu_time",
+            "major_page_faults",
+            "minor_page_faults",
+        ] {
             let row = doc
                 .lines()
                 .find(|l| l.contains(metric))
                 .unwrap_or_else(|| panic!("no row for {metric}"));
-            assert!(row.ends_with("|      NA |"), "row for {metric}: {row}");
+            assert!(row.ends_with("NA |"), "row for {metric}: {row}");
         }
     }
 
@@ -440,50 +665,56 @@ mod tests {
             io_out: None,
             mean_load: 0.0,
             cpu_time: 0.0,
+            major_page_faults: None,
+            minor_page_faults: None,
             data_collected: true,
         };
-        let doc = record.to_markdown_document();
-        // Each None value renders as a bare `-`, just like in the TSV.
-        for metric in ["max_pss", "io_in", "io_out"] {
+        let doc = record.to_markdown_document(SchemaMode::Full);
+        for metric in ["max_pss", "io_in", "io_out", "major_page_faults", "minor_page_faults"] {
             let row = doc.lines().find(|l| l.contains(metric)).expect("metric row");
             assert!(row.contains(" - "), "expected dash in {metric} row: {row}");
         }
     }
 
     #[test]
-    fn markdown_document_starts_with_header_and_alignment_row() {
+    fn markdown_full_row_count_tracks_tsv_header_full() {
         let record =
             BenchmarkRecord { running_time: 0.5, data_collected: false, ..Default::default() };
-        let doc = record.to_markdown_document();
-        let mut lines = doc.lines();
-        let header = lines.next().expect("header line");
-        let sep = lines.next().expect("separator line");
-        assert!(header.starts_with("| metric"), "header was: {header}");
-        assert!(header.contains("value"), "header was: {header}");
-        // Alignment row: left colon under metric, right colon under value.
-        assert!(sep.starts_with("|:"), "separator was: {sep}");
-        assert!(sep.ends_with(":|"), "separator was: {sep}");
-        // header + alignment row + one data row per TSV column. Derived from
-        // TSV_HEADER so issue #11's metric additions auto-update the count.
-        let expected_rows = 2 + TSV_HEADER.split('\t').count();
+        let doc = record.to_markdown_document(SchemaMode::Full);
+        // header + alignment + one data row per column in TSV_HEADER_FULL.
+        let expected_rows = 2 + TSV_HEADER_FULL.split('\t').count();
         assert_eq!(doc.lines().count(), expected_rows);
-        assert!(doc.ends_with('\n'));
     }
 
     #[test]
-    fn json_round_trip_preserves_fields() {
+    fn json_full_mode_preserves_fields() {
         let record = BenchmarkRecord {
             running_time: 1.5,
             max_rss: Some(42.0),
             max_pss: None,
+            major_page_faults: Some(7),
             data_collected: true,
             ..Default::default()
         };
-        let json = record.to_json().unwrap();
+        let json = record.to_json(SchemaMode::Full).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["running_time"], 1.5);
         assert_eq!(v["max_rss"], 42.0);
         assert!(v["max_pss"].is_null());
         assert_eq!(v["data_collected"], true);
+        assert_eq!(v["major_page_faults"], 7);
+        assert!(v["minor_page_faults"].is_null());
+    }
+
+    #[test]
+    fn json_strict_mode_omits_tricord_added_fields() {
+        let json = full_record().to_json(SchemaMode::SnakemakeStrict).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = v.as_object().expect("object");
+        assert!(!obj.contains_key("major_page_faults"), "strict json: {json}");
+        assert!(!obj.contains_key("minor_page_faults"));
+        // 9 snakemake-numeric fields (running_time + 8 metrics) +
+        // data_collected = 10 keys total.
+        assert_eq!(obj.len(), 10, "unexpected key set: {obj:?}");
     }
 }

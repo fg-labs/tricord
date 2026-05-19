@@ -4,6 +4,7 @@ use std::{path::PathBuf, process::ExitCode};
 
 use clap::Parser;
 use tricord::{
+    SchemaMode,
     cli::Args,
     run::{RunOptions, run_command},
 };
@@ -27,6 +28,7 @@ fn main() -> ExitCode {
         force_summary: args.summary,
         trace_path: args.trace.clone().map(PathBuf::into_boxed_path),
         markdown_path: args.export_markdown.clone().map(PathBuf::into_boxed_path),
+        schema_mode: if args.snakemake { SchemaMode::SnakemakeStrict } else { SchemaMode::Full },
     };
 
     match run_command(&command, &command_args, &options) {

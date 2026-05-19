@@ -121,21 +121,28 @@ fn sample_process(pid: i32) -> Option<ProcessSnapshot> {
         mach_time_to_seconds(task.pti_total_user) + mach_time_to_seconds(task.pti_total_system);
 
     let rusage_result: Result<RUsageInfoV4, _> = pidrusage(pid);
-    let (uss_bytes, pss_bytes, io_read_bytes, io_write_bytes) = match rusage_result {
-        Ok(rusage) => {
-            // ri_phys_footprint is Apple's per-task "owned memory that would
-            // be reclaimed on exit" — the closest analog to USS. We populate
-            // both USS and PSS with it; see module docs.
-            let footprint = rusage.ri_phys_footprint;
-            (
-                Some(footprint),
-                Some(footprint),
-                Some(rusage.ri_diskio_bytesread),
-                Some(rusage.ri_diskio_byteswritten),
-            )
-        }
-        Err(_) => (None, None, None, None),
-    };
+    let (uss_bytes, pss_bytes, io_read_bytes, io_write_bytes, major_page_faults) =
+        match rusage_result {
+            Ok(rusage) => {
+                // ri_phys_footprint is Apple's per-task "owned memory that
+                // would be reclaimed on exit" — the closest analog to USS.
+                // We populate both USS and PSS with it; see module docs.
+                let footprint = rusage.ri_phys_footprint;
+                (
+                    Some(footprint),
+                    Some(footprint),
+                    Some(rusage.ri_diskio_bytesread),
+                    Some(rusage.ri_diskio_byteswritten),
+                    // `ri_pageins` is the per-task major page-fault count
+                    // (pages brought in from backing store). The macOS
+                    // `proc_pid_rusage` struct does not expose minor faults,
+                    // so we leave `minor_page_faults` as `None` — the TSV
+                    // and trace render it as `-`.
+                    Some(rusage.ri_pageins),
+                )
+            }
+            Err(_) => (None, None, None, None, None),
+        };
 
     Some(ProcessSnapshot {
         pid,
@@ -146,6 +153,8 @@ fn sample_process(pid: i32) -> Option<ProcessSnapshot> {
         io_read_bytes,
         io_write_bytes,
         cpu_time_seconds,
+        major_page_faults,
+        minor_page_faults: None,
     })
 }
 

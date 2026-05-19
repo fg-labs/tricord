@@ -31,8 +31,10 @@ both spreadsheets and pipelines.
 
 - **Whole-tree accounting** — follows forked children and aggregates their
   resource usage; an exited child's I/O is still counted.
-- **Two output formats** — Snakemake-compatible TSV by default, one-line
-  JSON (`--format json`) for programmatic consumers.
+- **Two output formats** — TSV (Snakemake-compatible prefix, extended with
+  `tricord`-specific columns by default) or one-line JSON (`--format json`)
+  for programmatic consumers. Pass `--snakemake` to emit the strict 10-column
+  Snakemake schema when downstream tooling pins to it.
 - **Optional one-line summary** to stderr (`--summary`).
 - **Optional per-tick trace** (`--trace <PATH>`) — one TSV row per sample, so
   you can see how memory, I/O, and CPU evolved during the run instead of just
@@ -82,6 +84,8 @@ Options:
       --export-markdown <PATH>
                              Also write a Markdown table of the aggregate
                              record to this path
+      --snakemake            Emit only the original Snakemake aggregate schema
+                             (TSV, JSON, and Markdown). Does not affect --trace.
   -v, --verbose...           Increase log level (-v, -vv, -vvv)
   -h, --help                 Print help
   -V, --version              Print version
@@ -95,9 +99,15 @@ quoting), invoke `bash -c '...'` explicitly.
 
 ### TSV (default)
 
+By default `tricorder` emits a Snakemake-compatible 10-column prefix followed
+by every column it has added on top (`tricord`-extended schema). Pass
+`--snakemake` to drop the additions and produce exactly the original
+Snakemake schema; the prefix's column order and value formatting are
+identical in both modes.
+
 ```text
-s	h:m:s	max_rss	max_vms	max_uss	max_pss	io_in	io_out	mean_load	cpu_time
-12.3456	0:00:12	101.50	2048.00	95.20	96.00	1.25	0.50	175.00	21.60
+s	h:m:s	max_rss	max_vms	max_uss	max_pss	io_in	io_out	mean_load	cpu_time	major_page_faults	minor_page_faults
+12.3456	0:00:12	101.50	2048.00	95.20	96.00	1.25	0.50	175.00	21.60	42	1234
 ```
 
 | Column | Units | Meaning |
@@ -112,6 +122,8 @@ s	h:m:s	max_rss	max_vms	max_uss	max_pss	io_in	io_out	mean_load	cpu_time
 | `io_out` | MiB | Total bytes written to disk by the process tree |
 | `mean_load` | percent of one core | Average CPU load over the run (e.g. 175 = 1.75 cores) |
 | `cpu_time` | seconds | Total user + system CPU time across the process tree |
+| `major_page_faults` | integer | Total major page faults (pages brought in from backing store) across the tree. `tricord`-added; omitted under `--snakemake`. |
+| `minor_page_faults` | integer | Total minor page faults across the tree. `tricord`-added; omitted under `--snakemake`. Always `-` on macOS — see [Platform notes](#platform-notes). |
 
 Missing values render as `-`; if the run was too short for any sample to
 succeed, every resource column is `NA`.
@@ -123,10 +135,10 @@ per sampling tick — useful for "did it spike or stay flat?" plots and for
 post-mortem on OOM kills. The aggregate `--out` file is unaffected.
 
 ```text
-s	rss	vms	uss	pss	io_in	io_out	cpu_time	n_procs
-0.5012	102.30	2048.00	95.20	96.00	1.25	0.50	0.75	3
-1.0027	120.45	2048.00	112.10	113.00	2.50	1.00	1.55	3
-1.5042	101.50	2048.00	95.20	96.00	2.50	1.00	2.40	2
+s	rss	vms	uss	pss	io_in	io_out	cpu_time	n_procs	major_page_faults	minor_page_faults
+0.5012	102.30	2048.00	95.20	96.00	1.25	0.50	0.75	3	0	850
+1.0027	120.45	2048.00	112.10	113.00	2.50	1.00	1.55	3	2	1200
+1.5042	101.50	2048.00	95.20	96.00	2.50	1.00	2.40	2	0	340
 ```
 
 | Column | Units | Meaning |
@@ -136,17 +148,30 @@ s	rss	vms	uss	pss	io_in	io_out	cpu_time	n_procs
 | `io_in`, `io_out` | MiB | **Cumulative** bytes read/written across every PID observed so far (including exited children) |
 | `cpu_time` | seconds | Cumulative user + system CPU time across observed PIDs |
 | `n_procs` | integer | Number of live processes in this tick |
+| `major_page_faults`, `minor_page_faults` | integer | Page faults that occurred *during this tick* (per-tick delta, summed across observed PIDs). Minor is always `-` on macOS. |
 
 Memory columns are instantaneous, so they can go up *or down* between rows;
-I/O and CPU are cumulative, so they are monotonically non-decreasing.
+I/O, CPU, and the page-fault deltas describe activity within the tick — they
+can be zero or non-zero per row but won't drop a previously-counted total.
+The trace is `tricord`-native and is **not** affected by `--snakemake`.
 
 ### JSON (`--format json`)
+
+Default (full) mode includes `tricord`-added fields:
+
+```json
+{"running_time":12.3456,"max_rss":101.5,"max_vms":2048.0,"max_uss":95.2,"max_pss":96.0,"io_in":1.25,"io_out":0.5,"mean_load":175.0,"cpu_time":21.6,"major_page_faults":42,"minor_page_faults":1234,"data_collected":true}
+```
+
+Under `--snakemake` the `tricord`-added keys are *absent* from the object
+(not set to `null`), so downstream parsers that hard-code the Snakemake key
+set see exactly what they would have seen from `snakemake.benchmark`:
 
 ```json
 {"running_time":12.3456,"max_rss":101.5,"max_vms":2048.0,"max_uss":95.2,"max_pss":96.0,"io_in":1.25,"io_out":0.5,"mean_load":175.0,"cpu_time":21.6,"data_collected":true}
 ```
 
-Same fields, raw numeric types, `null` for missing.
+Raw numeric types, `null` for fields that the platform did not expose.
 
 ### Markdown (`--export-markdown <PATH>`)
 
@@ -189,6 +214,8 @@ macOS implementation uses [`libproc`]'s `proc_pidinfo` and `proc_pid_rusage`
 | `max_pss` | `/proc/<pid>/smaps_rollup` (Pss) | mirrors `max_uss` (kernel does not compute PSS — see below) |
 | `io_in`, `io_out` | `/proc/<pid>/io` | `proc_pid_rusage::ri_diskio_*` |
 | `cpu_time` | `/proc/<pid>/stat` (utime + stime) | `proc_taskinfo::pti_total_user + pti_total_system` |
+| `major_page_faults` | `/proc/<pid>/stat` (majflt) | `proc_pid_rusage::ri_pageins` |
+| `minor_page_faults` | `/proc/<pid>/stat` (minflt) | not exposed — column is `-` |
 
 ### macOS PSS approximation
 
@@ -220,6 +247,7 @@ use std::time::Duration;
 use tricord::{
     run::{run_command, RunOptions},
     format::OutputFormat,
+    SchemaMode,
 };
 
 let options = RunOptions {
@@ -229,6 +257,7 @@ let options = RunOptions {
     force_summary: false,
     trace_path: None,
     markdown_path: None,
+    schema_mode: SchemaMode::Full,
 };
 let outcome = run_command("samtools", &["sort".into(), "in.bam".into()], &options).unwrap();
 println!("exit={} cpu_time={:.2}s", outcome.exit_code(), outcome.record.cpu_time);
