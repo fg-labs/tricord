@@ -95,6 +95,12 @@ fn sample_process(pid: i32, ticks_per_second: f64) -> Option<ProcessSnapshot> {
     // surfaced as `status.threads` by procfs (`u64`).
     let thread_count = Some(status.threads);
 
+    // `/proc/<pid>/status` reports `VmSwap:` in kB when the process has
+    // anything swapped out; the field is absent on kernels without swap
+    // accounting per-process, hence `Option`. Multiply to bytes for the
+    // common sampler aggregation path.
+    let swap_bytes = status.vmswap.map(|kb| kb.saturating_mul(1024));
+
     Some(ProcessSnapshot {
         pid,
         rss_bytes,
@@ -109,6 +115,7 @@ fn sample_process(pid: i32, ticks_per_second: f64) -> Option<ProcessSnapshot> {
         voluntary_ctx_switches,
         involuntary_ctx_switches,
         thread_count,
+        swap_bytes,
     })
 }
 

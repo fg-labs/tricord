@@ -639,6 +639,58 @@ fn loadavg_is_not_added_to_trace_columns() {
     );
 }
 
+/// Peak swap usage shows up in the aggregate (MiB, summed across the
+/// process tree). The per-tick trace adds a `swap` column with the
+/// instantaneous summed value. macOS has no public per-process swap API,
+/// so both columns render `-` there.
+#[test]
+fn swap_columns_appear_in_aggregate_and_trace() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("timing.tsv");
+    let trace = tmp.path().join("trace.tsv");
+    let trace_str = trace.to_str().unwrap();
+    let result = run_bench(&out, "tsv", &["--trace", trace_str], &["sh", "-c", "sleep 0.4"]);
+    assert!(result.status.success(), "stderr: {}", String::from_utf8_lossy(&result.stderr));
+
+    let agg_text = std::fs::read_to_string(&out).expect("aggregate tsv");
+    let agg_header = agg_text.lines().next().expect("header");
+    let agg_cols: Vec<&str> = agg_header.split('\t').collect();
+    let data: Vec<&str> = agg_text.lines().nth(1).expect("data row").split('\t').collect();
+    let pos = |name: &str| {
+        agg_cols.iter().position(|c| *c == name).unwrap_or_else(|| panic!("agg col {name}"))
+    };
+    let max_swap = data[pos("max_swap")];
+    #[cfg(target_os = "linux")]
+    {
+        // Linux has VmSwap in /proc/<pid>/status; for a sleep it's typically
+        // 0.00 MiB but may be any non-negative float.
+        let v: f64 = max_swap.parse().unwrap_or_else(|_| panic!("max_swap parses: {max_swap}"));
+        assert!(v >= 0.0, "linux max_swap {v} must be >= 0");
+    }
+    #[cfg(target_os = "macos")]
+    {
+        assert_eq!(max_swap, "-", "macos max_swap should be `-` (no per-process swap API)");
+    }
+
+    let trace_text = std::fs::read_to_string(&trace).expect("trace tsv");
+    let trace_header = trace_text.lines().next().expect("trace header");
+    assert!(
+        trace_header.split('\t').any(|c| c == "swap"),
+        "trace header missing swap column: {trace_header}",
+    );
+}
+
+#[test]
+fn snakemake_strict_mode_strips_swap_column() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("timing.tsv");
+    let result = run_bench(&out, "tsv", &["--snakemake"], &["sh", "-c", "sleep 0.3"]);
+    assert!(result.status.success(), "stderr: {}", String::from_utf8_lossy(&result.stderr));
+
+    let header = std::fs::read_to_string(&out).unwrap().lines().next().unwrap().to_string();
+    assert!(!header.contains("max_swap"), "strict header: {header}");
+}
+
 fn python3_available() -> bool {
     Command::new("python3").arg("--version").output().is_ok_and(|o| o.status.success())
 }

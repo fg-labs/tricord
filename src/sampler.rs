@@ -70,6 +70,9 @@ pub struct ProcessSnapshot {
     /// per-tick `n_threads` (sum across PIDs) and aggregate `peak_n_threads`
     /// (max of those sums across ticks).
     pub thread_count: Option<u64>,
+    /// Swap bytes currently in use by this process. `None` on platforms
+    /// that do not expose per-process swap (macOS) or when the read fails.
+    pub swap_bytes: Option<u64>,
 }
 
 /// Per-PID accumulator; used to keep the latest seen value of monotonically-
@@ -98,6 +101,9 @@ pub struct SamplerState {
     max_vms_bytes: u64,
     max_uss_bytes: Option<u64>,
     max_pss_bytes: Option<u64>,
+    /// Peak summed swap bytes across the tree (max over ticks). `None` if
+    /// no process ever exposed swap counters (always so on macOS).
+    max_swap_bytes: Option<u64>,
     per_pid: HashMap<i32, ProcessAccum>,
     /// Per-PID cumulative counters at the end of the last tick — used to
     /// compute per-tick *deltas* for the trace TSV. Distinct from the
@@ -142,6 +148,7 @@ struct MemorySums {
     vms: u64,
     uss: Option<u64>,
     pss: Option<u64>,
+    swap: Option<u64>,
 }
 
 /// Cumulative I/O and CPU totals across every PID observed so far. `io_in`
@@ -163,8 +170,10 @@ fn sum_memory(snapshots: &[ProcessSnapshot]) -> MemorySums {
     let mut vms: u64 = 0;
     let mut uss: u64 = 0;
     let mut pss: u64 = 0;
+    let mut swap: u64 = 0;
     let mut any_uss = false;
     let mut any_pss = false;
+    let mut any_swap = false;
     for snap in snapshots {
         rss = rss.saturating_add(snap.rss_bytes);
         vms = vms.saturating_add(snap.vms_bytes);
@@ -176,12 +185,17 @@ fn sum_memory(snapshots: &[ProcessSnapshot]) -> MemorySums {
             pss = pss.saturating_add(v);
             any_pss = true;
         }
+        if let Some(v) = snap.swap_bytes {
+            swap = swap.saturating_add(v);
+            any_swap = true;
+        }
     }
     MemorySums {
         rss,
         vms,
         uss: if any_uss { Some(uss) } else { None },
         pss: if any_pss { Some(pss) } else { None },
+        swap: if any_swap { Some(swap) } else { None },
     }
 }
 
@@ -274,6 +288,9 @@ impl SamplerState {
         if let Some(v) = sums.pss {
             self.max_pss_bytes = Some(self.max_pss_bytes.unwrap_or(0).max(v));
         }
+        if let Some(v) = sums.swap {
+            self.max_swap_bytes = Some(self.max_swap_bytes.unwrap_or(0).max(v));
+        }
         // Instantaneous tree-wide thread + process counts at this tick.
         // Both follow the memory-style "max of per-tick sums" semantics —
         // they are not cumulative counters with deltas.
@@ -354,6 +371,7 @@ impl SamplerState {
             voluntary_ctx_switches: deltas.voluntary_ctx_switches,
             involuntary_ctx_switches: deltas.involuntary_ctx_switches,
             n_threads: sum_thread_count(snapshots),
+            swap: mem.swap.map(bytes_to_mib),
         })
     }
 
@@ -460,6 +478,7 @@ impl SamplerState {
             // sampler's lifetime, not inside the sampler itself.
             loadavg_1m_start: None,
             loadavg_1m_end: None,
+            max_swap: self.max_swap_bytes.map(bytes_to_mib),
             data_collected: true,
         }
     }

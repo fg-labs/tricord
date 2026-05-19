@@ -181,6 +181,11 @@ fn sample_process(pid: i32) -> Option<ProcessSnapshot> {
         voluntary_ctx_switches: None,
         involuntary_ctx_switches: None,
         thread_count,
+        // macOS has no public per-process swap-usage API. The Mach VM
+        // statistics aggregate system-wide swap activity but cannot be
+        // attributed per task; leaving as `None` mirrors the existing
+        // pattern for minor_page_faults / ctx switches on macOS.
+        swap_bytes: None,
     })
 }
 
