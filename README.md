@@ -1,5 +1,6 @@
 [![Build](https://github.com/fg-labs/tricord/actions/workflows/check.yml/badge.svg)](https://github.com/fg-labs/tricord/actions/workflows/check.yml)
 [![Version at crates.io](https://img.shields.io/crates/v/tricord)](https://crates.io/crates/tricord)
+[![Version at Bioconda](https://img.shields.io/conda/vn/bioconda/tricord?label=bioconda)](https://bioconda.github.io/recipes/tricord/README.html)
 [![Documentation at docs.rs](https://img.shields.io/docsrs/tricord)](https://docs.rs/tricord)
 [![codecov](https://codecov.io/gh/fg-labs/tricord/graph/badge.svg)](https://codecov.io/gh/fg-labs/tricord)
 [![License](http://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/fg-labs/tricord/blob/main/LICENSE)
