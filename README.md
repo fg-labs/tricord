@@ -4,6 +4,7 @@
 [![Documentation at docs.rs](https://img.shields.io/docsrs/tricord)](https://docs.rs/tricord)
 [![codecov](https://codecov.io/gh/fg-labs/tricord/graph/badge.svg)](https://codecov.io/gh/fg-labs/tricord)
 [![License](http://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/fg-labs/tricord/blob/main/LICENSE)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21445775.svg)](https://doi.org/10.5281/zenodo.21445775)
 
 # tricord
 
