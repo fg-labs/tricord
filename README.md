@@ -108,8 +108,8 @@ Snakemake schema; the prefix's column order and value formatting are
 identical in both modes.
 
 ```text
-s	h:m:s	max_rss	max_vms	max_uss	max_pss	io_in	io_out	mean_load	cpu_time	major_page_faults	minor_page_faults	voluntary_ctx_switches	involuntary_ctx_switches	peak_n_threads	peak_n_procs	loadavg_1m_start	loadavg_1m_end	max_swap
-12.3456	0:00:12	101.50	2048.00	95.20	96.00	1.25	0.50	175.00	21.60	42	1234	80	7	13	4	0.50	2.25	64.00
+s	h:m:s	max_rss	max_vms	max_uss	max_pss	io_in	io_out	mean_load	cpu_time	major_page_faults	minor_page_faults	voluntary_ctx_switches	involuntary_ctx_switches	peak_n_threads	peak_n_procs	loadavg_1m_start	loadavg_1m_end	max_swap	page_cache_start	page_cache_end
+12.3456	0:00:12	101.50	2048.00	95.20	96.00	1.25	0.50	175.00	21.60	42	1234	80	7	13	4	0.50	2.25	64.00	512.00	480.25
 ```
 
 | Column | Units | Meaning |
@@ -133,6 +133,8 @@ s	h:m:s	max_rss	max_vms	max_uss	max_pss	io_in	io_out	mean_load	cpu_time	major_pa
 | `loadavg_1m_start` | float (`%.2f`) | System 1-minute load average sampled just before the child started. Frames the rest of the numbers — a peak `cpu_time` of 800% on an idle host (loadavg ~1) means something very different from the same peak on a thrashing host. `tricord`-added; omitted under `--snakemake`. |
 | `loadavg_1m_end` | float (`%.2f`) | System 1-minute load average sampled just after the child exited. Paired with `loadavg_1m_start` to show whether the run drove the host load up. `tricord`-added; omitted under `--snakemake`. |
 | `max_swap` | MiB | Peak summed swap usage across the process tree (max over sampling ticks of `VmSwap` summed across PIDs). `tricord`-added; omitted under `--snakemake`. Always `-` on macOS — the kernel has no public per-process swap-usage API. |
+| `page_cache_start` | MiB | System page-cache size (`Cached` in `/proc/meminfo`) sampled just before the child started. Frames the memory numbers the same way `loadavg_1m_start` frames CPU numbers: a run slowed by page-cache eviction from other work on the host looks identical to a real regression without it. `tricord`-added; omitted under `--snakemake`. On macOS renders `-` (no `Cached` equivalent) once a sample was taken, or `NA` like every other resource column if the run ended before the first sample — see [Platform notes](#platform-notes). |
+| `page_cache_end` | MiB | System page-cache size sampled just after the child exited. Paired with `page_cache_start` — a drop is a direct sign the run (or a neighbor) evicted cached pages. `tricord`-added; omitted under `--snakemake`. On macOS renders `-` once a sample was taken, or `NA` if the run ended before the first sample. |
 
 Missing values render as `-`; if the run was too short for any sample to
 succeed, every resource column is `NA`.
@@ -172,7 +174,7 @@ The trace is `tricord`-native and is **not** affected by `--snakemake`.
 Default (full) mode includes `tricord`-added fields:
 
 ```json
-{"running_time":12.3456,"max_rss":101.5,"max_vms":2048.0,"max_uss":95.2,"max_pss":96.0,"io_in":1.25,"io_out":0.5,"mean_load":175.0,"cpu_time":21.6,"major_page_faults":42,"minor_page_faults":1234,"voluntary_ctx_switches":80,"involuntary_ctx_switches":7,"peak_n_threads":13,"peak_n_procs":4,"loadavg_1m_start":0.50,"loadavg_1m_end":2.25,"max_swap":64.0,"data_collected":true}
+{"running_time":12.3456,"max_rss":101.5,"max_vms":2048.0,"max_uss":95.2,"max_pss":96.0,"io_in":1.25,"io_out":0.5,"mean_load":175.0,"cpu_time":21.6,"major_page_faults":42,"minor_page_faults":1234,"voluntary_ctx_switches":80,"involuntary_ctx_switches":7,"peak_n_threads":13,"peak_n_procs":4,"loadavg_1m_start":0.50,"loadavg_1m_end":2.25,"max_swap":64.0,"page_cache_start":512.0,"page_cache_end":480.25,"data_collected":true}
 ```
 
 Under `--snakemake` the `tricord`-added keys are *absent* from the object
@@ -232,6 +234,7 @@ macOS implementation uses [`libproc`]'s `proc_pidinfo` and `proc_pid_rusage`
 | `peak_n_threads`, `n_threads` | `/proc/<pid>/status` (`threads`) | `proc_taskinfo::pti_threadnum` |
 | `loadavg_1m_start`, `loadavg_1m_end` | `/proc/loadavg` (first field) | `getloadavg(3)` |
 | `max_swap`, `swap` | `/proc/<pid>/status` (`VmSwap`) | not exposed — both columns are `-` |
+| `page_cache_start`, `page_cache_end` | `/proc/meminfo` (`Cached`) | not exposed — both columns are `-` once a sample was taken, or `NA` if the run ended before the first sample (matching every other resource column). macOS's VM system does not track file-backed page-cache pages as a separate, directly comparable quantity. |
 
 ### macOS PSS approximation
 

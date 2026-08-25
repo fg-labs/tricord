@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use procfs::{process, process::Process};
+use procfs::{Current, Meminfo, process, process::Process};
 
 use super::ProcessSampler;
 use crate::sampler::ProcessSnapshot;
@@ -126,6 +126,19 @@ fn sample_process(pid: i32, ticks_per_second: f64) -> Option<ProcessSnapshot> {
 pub fn read_loadavg_1m() -> Option<f64> {
     let text = std::fs::read_to_string("/proc/loadavg").ok()?;
     text.split_whitespace().next()?.parse::<f64>().ok()
+}
+
+/// Read the system page-cache size (`Cached` in `/proc/meminfo`), in MiB.
+///
+/// `Cached` is in-memory storage for file contents read from disk — memory
+/// the kernel reclaims under pressure before it would ever swap, so a value
+/// that drops between two readings is a direct sign the run competed for
+/// cache space with other work on the host. Returns `None` if `/proc/meminfo`
+/// cannot be read or parsed.
+#[must_use]
+pub fn read_page_cache_mb() -> Option<f64> {
+    let cached_bytes = Meminfo::current().ok()?.cached;
+    Some(cached_bytes as f64 / (1024.0 * 1024.0))
 }
 
 /// Parse `/proc/<pid>/smaps_rollup` for USS and PSS. Returns `(None, None)` if

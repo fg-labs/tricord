@@ -50,6 +50,16 @@ pub fn read_loadavg_1m() -> Option<f64> {
     if written < 1 { None } else { Some(buf[0]) }
 }
 
+/// Always `None` on macOS: there is no equivalent of Linux's `Cached` page
+/// cache. macOS's VM system unifies the page cache into the general free/
+/// active/inactive page accounting (`vm_stat`/`host_statistics64`) rather
+/// than tracking file-backed cache pages as a separate, directly comparable
+/// quantity, so there is no single number that means the same thing.
+#[must_use]
+pub fn read_page_cache_mb() -> Option<f64> {
+    None
+}
+
 /// `(numer, denom)` from `mach_timebase_info`, cached once per process.
 ///
 /// `pti_total_user` / `pti_total_system` are in Mach absolute time units,

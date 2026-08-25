@@ -22,7 +22,8 @@ pub const TSV_HEADER_FULL: &str = "s\th:m:s\tmax_rss\tmax_vms\tmax_uss\tmax_pss\
                                    voluntary_ctx_switches\tinvoluntary_ctx_switches\t\
                                    peak_n_threads\tpeak_n_procs\t\
                                    loadavg_1m_start\tloadavg_1m_end\t\
-                                   max_swap";
+                                   max_swap\t\
+                                   page_cache_start\tpage_cache_end";
 
 /// Return the appropriate aggregate header for the requested schema mode.
 #[must_use]
@@ -213,6 +214,20 @@ pub struct BenchmarkRecord {
     /// no process exposed swap counters during the run — always `None` on
     /// macOS (the kernel has no public per-process swap-usage API).
     pub max_swap: Option<f64>,
+    /// System page-cache size (`Cached` in `/proc/meminfo`) sampled just
+    /// before the child started, in MiB. `None` if the platform read
+    /// failed — always `None` on macOS, which has no equivalent of Linux's
+    /// `Cached` accounting.
+    pub page_cache_start: Option<f64>,
+    /// System page-cache size sampled just after the child exited, in MiB.
+    /// `None` if the platform read failed — always `None` on macOS.
+    /// Pairing start + end frames the resource numbers the same way
+    /// `loadavg_1m_start`/`loadavg_1m_end` do, for memory pressure instead
+    /// of CPU pressure: a run that got slower because its working set was
+    /// evicted from cache by other work on the host looks identical to a
+    /// real regression without this — a drop from start to end is the
+    /// signal.
+    pub page_cache_end: Option<f64>,
     /// Whether at least one sample successfully read OS resource counters.
     ///
     /// When `false` the TSV row is rendered with `NA` placeholders for every
@@ -236,8 +251,8 @@ impl BenchmarkRecord {
 
         let extra_cols = match mode {
             // page faults (2) + ctx switches (2) + peak n_threads + n_procs
-            // + loadavg start/end (2) + max_swap = 9
-            SchemaMode::Full => 9,
+            // + loadavg start/end (2) + max_swap + page_cache start/end (2) = 11
+            SchemaMode::Full => 11,
             SchemaMode::SnakemakeStrict => 0,
         };
 
@@ -269,7 +284,13 @@ impl BenchmarkRecord {
             // peak_n_procs is a plain `u64`, not Option, so render bare —
             // when `data_collected` is true it's always populated.
             write!(out, "\t{}", self.peak_n_procs).unwrap();
-            for value in [self.loadavg_1m_start, self.loadavg_1m_end, self.max_swap] {
+            for value in [
+                self.loadavg_1m_start,
+                self.loadavg_1m_end,
+                self.max_swap,
+                self.page_cache_start,
+                self.page_cache_end,
+            ] {
                 out.push('\t');
                 out.push_str(&format_optional_float(value));
             }
@@ -372,6 +393,8 @@ impl BenchmarkRecord {
             rows.push(("loadavg_1m_start", cell(self.loadavg_1m_start)));
             rows.push(("loadavg_1m_end", cell(self.loadavg_1m_end)));
             rows.push(("max_swap", cell(self.max_swap)));
+            rows.push(("page_cache_start", cell(self.page_cache_start)));
+            rows.push(("page_cache_end", cell(self.page_cache_end)));
         }
         rows
     }
@@ -493,6 +516,8 @@ mod tests {
             loadavg_1m_start: Some(0.50),
             loadavg_1m_end: Some(2.25),
             max_swap: Some(64.00),
+            page_cache_start: Some(512.00),
+            page_cache_end: Some(480.25),
             data_collected: true,
         }
     }
@@ -520,6 +545,8 @@ mod tests {
             "involuntary_ctx_switches",
             "peak_n_threads",
             "peak_n_procs",
+            "page_cache_start",
+            "page_cache_end",
         ] {
             assert!(full_cols.contains(&col), "missing {col} in {TSV_HEADER_FULL}");
         }
@@ -581,11 +608,12 @@ mod tests {
     #[test]
     fn tsv_row_full_mode_appends_all_tricord_columns() {
         // full_record(): page faults 42/1234, ctx switches 80/7, peak
-        // threads 13, peak procs 4, loadavg 0.50 → 2.25, max_swap 64.00.
+        // threads 13, peak procs 4, loadavg 0.50 → 2.25, max_swap 64.00,
+        // page_cache 512.00 → 480.25.
         assert_eq!(
             full_record().to_tsv_row(SchemaMode::Full),
             "12.3456\t0:00:12\t101.50\t2048.00\t95.20\t96.00\t1.25\t0.50\t175.00\t21.60\t\
-             42\t1234\t80\t7\t13\t4\t0.50\t2.25\t64.00",
+             42\t1234\t80\t7\t13\t4\t0.50\t2.25\t64.00\t512.00\t480.25",
         );
     }
 
@@ -602,7 +630,8 @@ mod tests {
     fn tsv_row_full_mode_renders_missing_tricord_metrics_as_dash() {
         // Option-typed tricord metrics render as `-` when None; the plain
         // `peak_n_procs: u64` renders as its bare integer (full_record's 4).
-        // Loadavg + max_swap fields are Option<f64>, also render as `-`.
+        // Loadavg, max_swap, and page_cache fields are Option<f64>, also
+        // render as `-`.
         let record = BenchmarkRecord {
             major_page_faults: None,
             minor_page_faults: None,
@@ -612,10 +641,12 @@ mod tests {
             loadavg_1m_start: None,
             loadavg_1m_end: None,
             max_swap: None,
+            page_cache_start: None,
+            page_cache_end: None,
             ..full_record()
         };
         let row = record.to_tsv_row(SchemaMode::Full);
-        assert!(row.ends_with("\t-\t-\t-\t-\t-\t4\t-\t-\t-"), "row was: {row}");
+        assert!(row.ends_with("\t-\t-\t-\t-\t-\t4\t-\t-\t-\t-\t-"), "row was: {row}");
     }
 
     #[test]
@@ -724,9 +755,9 @@ mod tests {
 
     #[test]
     fn markdown_full_data_exact_layout() {
-        // Widest label is still "involuntary_ctx_switches" (24 chars); PR 4
-        // adds "loadavg_1m_start"/"loadavg_1m_end" (16 chars) — narrower,
-        // so widths don't shift. Two new rows at the bottom.
+        // Widest label is still "involuntary_ctx_switches" (24 chars);
+        // "page_cache_start"/"page_cache_end" (16/14 chars) are narrower, so
+        // widths don't shift. Two new rows at the bottom.
         //
         // When new metrics land (tracking issue #11 on fg-labs/tricord), this
         // golden block needs re-recording — both for the new rows and for any
@@ -753,6 +784,8 @@ mod tests {
 | loadavg_1m_start         |    0.50 |
 | loadavg_1m_end           |    2.25 |
 | max_swap                 |   64.00 |
+| page_cache_start         |  512.00 |
+| page_cache_end           |  480.25 |
 ";
         assert_eq!(full_record().to_markdown_document(SchemaMode::Full), expected);
     }
@@ -814,6 +847,8 @@ mod tests {
             loadavg_1m_start: None,
             loadavg_1m_end: None,
             max_swap: None,
+            page_cache_start: None,
+            page_cache_end: None,
             data_collected: true,
         };
         let doc = record.to_markdown_document(SchemaMode::Full);
@@ -829,6 +864,8 @@ mod tests {
             "loadavg_1m_start",
             "loadavg_1m_end",
             "max_swap",
+            "page_cache_start",
+            "page_cache_end",
         ] {
             let row = doc.lines().find(|l| l.contains(metric)).expect("metric row");
             assert!(row.contains(" - "), "expected dash in {metric} row: {row}");

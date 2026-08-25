@@ -474,11 +474,13 @@ impl SamplerState {
             involuntary_ctx_switches: cum.involuntary_ctx_switches,
             peak_n_threads: self.max_n_threads,
             peak_n_procs: self.max_n_procs,
-            // Loadavg start/end are captured by run_command around the
-            // sampler's lifetime, not inside the sampler itself.
+            // Loadavg and page-cache start/end are captured by run_command
+            // around the sampler's lifetime, not inside the sampler itself.
             loadavg_1m_start: None,
             loadavg_1m_end: None,
             max_swap: self.max_swap_bytes.map(bytes_to_mib),
+            page_cache_start: None,
+            page_cache_end: None,
             data_collected: true,
         }
     }

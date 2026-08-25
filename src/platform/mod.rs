@@ -55,3 +55,23 @@ pub fn read_loadavg_1m() -> Option<f64> {
         macos::read_loadavg_1m()
     }
 }
+
+/// Read the system page-cache size, in MiB.
+///
+/// Returns `None` if the platform read fails, or unconditionally on macOS,
+/// which has no equivalent of Linux's `Cached` accounting — see
+/// `macos::read_page_cache_mb`. Used by `run_command` to snapshot system
+/// context at run start and end, the same way `read_loadavg_1m` frames CPU
+/// pressure: a workload slowed by page-cache eviction from other work on the
+/// host looks identical to a real regression without this.
+#[must_use]
+pub fn read_page_cache_mb() -> Option<f64> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::read_page_cache_mb()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos::read_page_cache_mb()
+    }
+}
