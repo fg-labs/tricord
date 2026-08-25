@@ -126,6 +126,8 @@ mod tests {
             loadavg_1m_start: Some(0.75),
             loadavg_1m_end: Some(1.10),
             max_swap: Some(0.25),
+            page_cache_start: Some(256.0),
+            page_cache_end: Some(240.0),
             data_collected: true,
         }
     }
@@ -141,13 +143,14 @@ mod tests {
         assert!(lines[0].contains("\tvoluntary_ctx_switches\tinvoluntary_ctx_switches\t"));
         assert!(lines[0].contains("\tpeak_n_threads\tpeak_n_procs\t"));
         assert!(lines[0].contains("\tloadavg_1m_start\tloadavg_1m_end\t"));
-        assert!(lines[0].ends_with("\tmax_swap"));
+        assert!(lines[0].contains("\tmax_swap\t"));
+        assert!(lines[0].ends_with("\tpage_cache_start\tpage_cache_end"));
         assert!(lines[1].starts_with("0.5000\t"));
         // sample_record(): major=3 minor=120 voluntary=40 involuntary=5
         //                  peak_n_threads=6 peak_n_procs=2 loadavg 0.75 → 1.10
-        //                  max_swap=0.25
+        //                  max_swap=0.25 page_cache 256.0 → 240.0
         assert!(
-            lines[1].ends_with("\t3\t120\t40\t5\t6\t2\t0.75\t1.10\t0.25"),
+            lines[1].ends_with("\t3\t120\t40\t5\t6\t2\t0.75\t1.10\t0.25\t256.00\t240.00"),
             "data row: {}",
             lines[1]
         );

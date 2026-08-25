@@ -75,6 +75,14 @@ pub fn run_command(command: &str, args: &[String], options: &RunOptions) -> io::
     // and the user loses data with no warning.
     validate_output_paths(options)?;
 
+    // Snapshot system loadavg and page-cache size before the child spawns
+    // so the "start" values reflect state entering the run (before our
+    // child has had time to contribute meaningfully to the loadavg EMA, or
+    // to perturb the page cache with its own reads/writes) — not state the
+    // child has already touched.
+    let loadavg_start = platform::read_loadavg_1m();
+    let page_cache_start = platform::read_page_cache_mb();
+
     let mut cmd = Command::new(command);
     cmd.args(args);
     cmd.stdin(Stdio::inherit());
@@ -89,10 +97,6 @@ pub fn run_command(command: &str, args: &[String], options: &RunOptions) -> io::
     // Install signal forwarding before the sampler so a fast Ctrl-C still
     // reaches the child even if the sampler thread hasn't started yet.
     let signals = SignalForwarder::install(child_pid)?;
-    // Snapshot system loadavg just before the sampler starts so the
-    // "start" value reflects load entering the run (before our child has
-    // had time to contribute meaningfully to the EMA).
-    let loadavg_start = platform::read_loadavg_1m();
     let sampler = SamplerHandle::spawn(
         child_pid,
         SamplerOptions { interval: options.interval, trace_path: options.trace_path.clone() },
@@ -101,8 +105,11 @@ pub fn run_command(command: &str, args: &[String], options: &RunOptions) -> io::
     let status = child.wait()?;
     let mut record = sampler.stop();
     let loadavg_end = platform::read_loadavg_1m();
+    let page_cache_end = platform::read_page_cache_mb();
     record.loadavg_1m_start = loadavg_start;
     record.loadavg_1m_end = loadavg_end;
+    record.page_cache_start = page_cache_start;
+    record.page_cache_end = page_cache_end;
     drop(signals);
 
     format::write_to_path(&record, &options.output_path, options.format, options.schema_mode)?;

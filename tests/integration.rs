@@ -691,6 +691,69 @@ fn snakemake_strict_mode_strips_swap_column() {
     assert!(!header.contains("max_swap"), "strict header: {header}");
 }
 
+/// System page-cache size (`Cached` in `/proc/meminfo`) is sampled at start
+/// and end of the run and added as two aggregate columns, mirroring
+/// `loadavg_1m_start`/`loadavg_1m_end`. macOS has no equivalent of Linux's
+/// `Cached` accounting, so both columns render `-` there.
+#[test]
+fn page_cache_start_and_end_appear_in_aggregate_tsv() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("timing.tsv");
+    let result = run_bench(&out, "tsv", &[], &["sh", "-c", "sleep 0.3"]);
+    assert!(result.status.success(), "stderr: {}", String::from_utf8_lossy(&result.stderr));
+
+    let text = std::fs::read_to_string(&out).expect("aggregate tsv");
+    let header = text.lines().next().expect("header");
+    let header_cols: Vec<&str> = header.split('\t').collect();
+    let cols: Vec<&str> = text.lines().nth(1).expect("data row").split('\t').collect();
+    let pos = |name: &str| {
+        header_cols.iter().position(|c| *c == name).unwrap_or_else(|| panic!("col {name}"))
+    };
+    let start = cols[pos("page_cache_start")];
+    let end = cols[pos("page_cache_end")];
+    #[cfg(target_os = "linux")]
+    {
+        let start_v: f64 = start.parse().unwrap_or_else(|_| panic!("page_cache_start: {start}"));
+        let end_v: f64 = end.parse().unwrap_or_else(|_| panic!("page_cache_end: {end}"));
+        assert!(start_v >= 0.0, "page_cache_start {start_v} must be >= 0 on any real Linux host");
+        assert!(end_v >= 0.0, "page_cache_end {end_v} must be >= 0 on any real Linux host");
+    }
+    #[cfg(target_os = "macos")]
+    {
+        assert_eq!(start, "-", "macos page_cache_start should be `-` (no Cached equivalent)");
+        assert_eq!(end, "-", "macos page_cache_end should be `-` (no Cached equivalent)");
+    }
+}
+
+#[test]
+fn snakemake_strict_mode_strips_page_cache_columns() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("timing.tsv");
+    let result = run_bench(&out, "tsv", &["--snakemake"], &["sh", "-c", "sleep 0.3"]);
+    assert!(result.status.success(), "stderr: {}", String::from_utf8_lossy(&result.stderr));
+
+    let header = std::fs::read_to_string(&out).unwrap().lines().next().unwrap().to_string();
+    assert!(!header.contains("page_cache_start"), "strict header: {header}");
+    assert!(!header.contains("page_cache_end"), "strict header: {header}");
+}
+
+#[test]
+fn page_cache_is_not_added_to_trace_columns() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("timing.tsv");
+    let trace = tmp.path().join("trace.tsv");
+    let trace_str = trace.to_str().unwrap();
+    let result = run_bench(&out, "tsv", &["--trace", trace_str], &["sh", "-c", "sleep 0.4"]);
+    assert!(result.status.success(), "stderr: {}", String::from_utf8_lossy(&result.stderr));
+
+    let trace_header = std::fs::read_to_string(&trace).unwrap().lines().next().unwrap().to_string();
+    assert!(
+        !trace_header.contains("page_cache"),
+        "trace TSV must not include page_cache (system-wide, not a per-process/per-tick \
+         quantity the way rss/io/cpu are): {trace_header}",
+    );
+}
+
 fn python3_available() -> bool {
     Command::new("python3").arg("--version").output().is_ok_and(|o| o.status.success())
 }
