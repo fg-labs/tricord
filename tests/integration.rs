@@ -96,7 +96,7 @@ fn json_output_emits_no_trailing_newline() {
 fn json_pretty_output_round_trips_to_object() {
     let tmp = tempfile::tempdir().unwrap();
     let out = tmp.path().join("timing.json");
-    let result = run_bench(&out, "json_pretty", &[], &["sh", "-c", "sleep 0.6"]);
+    let result = run_bench(&out, "json-pretty", &[], &["sh", "-c", "sleep 0.6"]);
     assert!(result.status.success());
 
     let text = std::fs::read_to_string(&out).unwrap();

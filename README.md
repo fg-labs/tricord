@@ -35,7 +35,7 @@ JSON, suited to spreadsheets, pipelines, and human readers.
   resource usage; an exited child's I/O is still counted.
 - **Three output formats** — TSV (Snakemake-compatible prefix, extended with
   `tricord`-specific columns by default), one-line JSON (`--format json`)
-  for programmatic consumers, or pretty-printed JSON (`--format json_pretty`)
+  for programmatic consumers, or pretty-printed JSON (`--format json-pretty`)
   for human readers. Pass `--snakemake` to emit the strict 10-column
   Snakemake schema when downstream tooling pins to it.
 - **Optional one-line summary** to stderr (`--summary`).
@@ -80,7 +80,7 @@ Usage: tricorder [OPTIONS] --out <PATH> -- <CMD>...
 
 Options:
       --out <PATH>           Output file path
-      --format <FORMAT>      tsv | json | json_pretty [default: tsv]
+      --format <FORMAT>      tsv | json | json-pretty [default: tsv]
       --interval <SECONDS>   Sampling interval [default: 0.5]
       --summary              Print one-line summary to stderr after the run
       --trace <PATH>         Also write a per-tick TSV trace to this path
