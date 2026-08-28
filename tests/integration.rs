@@ -82,6 +82,22 @@ fn json_output_round_trips_to_object() {
 }
 
 #[test]
+fn json_pretty_output_round_trips_to_object() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("timing.json");
+    let result = run_bench(&out, "json_pretty", &[], &["sh", "-c", "sleep 0.6"]);
+    assert!(result.status.success());
+
+    let text = std::fs::read_to_string(&out).unwrap();
+    // One line per field (21 in full mode) plus the two brace lines.
+    assert_eq!(text.trim().lines().count(), 23, "pretty output: {text}");
+    let value: serde_json::Value = serde_json::from_str(text.trim()).expect("valid json");
+    assert!(value.is_object());
+    assert!(value["running_time"].as_f64().expect("running_time number") >= 0.5);
+    assert_eq!(value["data_collected"], true);
+}
+
+#[test]
 fn nested_output_directory_is_created() {
     let tmp = tempfile::tempdir().unwrap();
     let out = tmp.path().join("does/not/exist/yet/timing.tsv");

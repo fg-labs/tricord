@@ -15,6 +15,8 @@ pub enum OutputFormat {
     Tsv,
     /// Single JSON object, one line, no trailing newline.
     Json,
+    /// Single JSON object, pretty-printed.
+    JsonPretty,
 }
 
 impl OutputFormat {
@@ -23,7 +25,7 @@ impl OutputFormat {
     pub fn extension(self) -> &'static str {
         match self {
             Self::Tsv => "tsv",
-            Self::Json => "json",
+            Self::Json | Self::JsonPretty => "json",
         }
     }
 }
@@ -75,6 +77,10 @@ pub fn write_to<W: Write>(
         OutputFormat::Tsv => writer.write_all(record.to_tsv_document(mode).as_bytes()),
         OutputFormat::Json => {
             let json = record.to_json(mode).map_err(io::Error::other)?;
+            writer.write_all(json.as_bytes())
+        }
+        OutputFormat::JsonPretty => {
+            let json = record.to_json_pretty(mode).map_err(io::Error::other)?;
             writer.write_all(json.as_bytes())?;
             writer.write_all(b"\n")
         }
@@ -86,7 +92,7 @@ pub fn write_to<W: Write>(
 ///
 /// Lives alongside [`write_to_path`] but takes no `OutputFormat`: Markdown is
 /// a sidecar output (`--export-markdown`) that can be requested alongside the
-/// primary `--out`/`--format` file, not a third value of `--format`.
+/// primary `--out`/`--format` file, not a value of `--format`.
 ///
 /// # Errors
 /// Returns any I/O error from the file system.
@@ -130,6 +136,13 @@ mod tests {
             page_cache_end: Some(240.0),
             data_collected: true,
         }
+    }
+
+    #[test]
+    fn extension_matches_each_format() {
+        assert_eq!(OutputFormat::Tsv.extension(), "tsv");
+        assert_eq!(OutputFormat::Json.extension(), "json");
+        assert_eq!(OutputFormat::JsonPretty.extension(), "json");
     }
 
     #[test]
@@ -185,6 +198,32 @@ mod tests {
     fn json_writer_strict_mode_omits_tricord_fields() {
         let mut buf = Vec::new();
         write_to(&sample_record(), &mut buf, OutputFormat::Json, SchemaMode::SnakemakeStrict)
+            .unwrap();
+        let text = std::str::from_utf8(&buf).unwrap().trim_end();
+        let value: serde_json::Value = serde_json::from_str(text).unwrap();
+        let obj = value.as_object().unwrap();
+        assert!(!obj.contains_key("major_page_faults"));
+        assert!(!obj.contains_key("minor_page_faults"));
+    }
+
+    #[test]
+    fn json_pretty_writer_full_mode_includes_tricord_fields() {
+        let mut buf = Vec::new();
+        write_to(&sample_record(), &mut buf, OutputFormat::JsonPretty, SchemaMode::Full).unwrap();
+        let text = std::str::from_utf8(&buf).unwrap().trim_end();
+        // One line per field (21 in full mode) plus the two brace lines.
+        assert_eq!(text.lines().count(), 23, "pretty output: {text}");
+        let value: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert!(value.is_object());
+        assert_eq!(value["data_collected"], true);
+        assert_eq!(value["major_page_faults"], 3);
+        assert_eq!(value["minor_page_faults"], 120);
+    }
+
+    #[test]
+    fn json_pretty_writer_strict_mode_omits_tricord_fields() {
+        let mut buf = Vec::new();
+        write_to(&sample_record(), &mut buf, OutputFormat::JsonPretty, SchemaMode::SnakemakeStrict)
             .unwrap();
         let text = std::str::from_utf8(&buf).unwrap().trim_end();
         let value: serde_json::Value = serde_json::from_str(text).unwrap();

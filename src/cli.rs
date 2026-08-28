@@ -75,6 +75,9 @@ pub enum Format {
     Tsv,
     /// Single JSON object on one line.
     Json,
+    /// Single JSON object, pretty-printed across multiple lines.
+    #[value(name = "json_pretty", alias = "json-pretty")]
+    JsonPretty,
 }
 
 impl From<Format> for OutputFormat {
@@ -82,6 +85,7 @@ impl From<Format> for OutputFormat {
         match value {
             Format::Tsv => Self::Tsv,
             Format::Json => Self::Json,
+            Format::JsonPretty => Self::JsonPretty,
         }
     }
 }
@@ -138,6 +142,22 @@ mod tests {
         ]);
         assert_eq!(args.format, Format::Json);
         assert!(args.summary);
+    }
+
+    #[test]
+    fn parses_json_pretty_format() {
+        for value in ["json_pretty", "json-pretty"] {
+            let args = Args::parse_from([
+                "tricorder",
+                "--out",
+                "out.json",
+                "--format",
+                value,
+                "--",
+                "true",
+            ]);
+            assert_eq!(args.format, Format::JsonPretty);
+        }
     }
 
     #[test]
