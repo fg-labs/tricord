@@ -14,8 +14,8 @@ memory, and disk I/O it used. The companion binary is named `tricorder`.
 Think of it as a more thorough `/usr/bin/time -v`: it polls the process tree
 on an interval, follows children and grandchildren, and writes a single
 record summarising peak memory, total bytes read/written, average CPU load,
-and total CPU time. Output is either a tidy TSV or one-line JSON, suited to
-both spreadsheets and pipelines.
+and total CPU time. Output is a tidy TSV, one-line JSON, or pretty-printed
+JSON, suited to spreadsheets, pipelines, and human readers.
 
 <p>
 <a href="https://fulcrumgenomics.com">
@@ -33,9 +33,10 @@ both spreadsheets and pipelines.
 
 - **Whole-tree accounting** — follows forked children and aggregates their
   resource usage; an exited child's I/O is still counted.
-- **Two output formats** — TSV (Snakemake-compatible prefix, extended with
-  `tricord`-specific columns by default) or one-line JSON (`--format json`)
-  for programmatic consumers. Pass `--snakemake` to emit the strict 10-column
+- **Three output formats** — TSV (Snakemake-compatible prefix, extended with
+  `tricord`-specific columns by default), one-line JSON (`--format json`)
+  for programmatic consumers, or pretty-printed JSON (`--format json-pretty`)
+  for human readers. Pass `--snakemake` to emit the strict 10-column
   Snakemake schema when downstream tooling pins to it.
 - **Optional one-line summary** to stderr (`--summary`).
 - **Optional per-tick trace** (`--trace <PATH>`) — one TSV row per sample, so
@@ -79,7 +80,7 @@ Usage: tricorder [OPTIONS] --out <PATH> -- <CMD>...
 
 Options:
       --out <PATH>           Output file path
-      --format <FORMAT>      tsv | json [default: tsv]
+      --format <FORMAT>      tsv | json | json-pretty [default: tsv]
       --interval <SECONDS>   Sampling interval [default: 0.5]
       --summary              Print one-line summary to stderr after the run
       --trace <PATH>         Also write a per-tick TSV trace to this path

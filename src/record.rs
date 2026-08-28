@@ -322,9 +322,24 @@ impl BenchmarkRecord {
     /// Returns an error only if `serde_json` itself fails (which should not
     /// happen for this struct).
     pub fn to_json(&self, mode: SchemaMode) -> serde_json::Result<String> {
+        self.to_json_string(mode, false)
+    }
+
+    /// Like [`Self::to_json`], but pretty-printed.
+    ///
+    /// # Errors
+    /// As for [`Self::to_json`].
+    pub fn to_json_pretty(&self, mode: SchemaMode) -> serde_json::Result<String> {
+        self.to_json_string(mode, true)
+    }
+
+    fn to_json_string(&self, mode: SchemaMode, pretty: bool) -> serde_json::Result<String> {
+        fn to_string<T: serde::Serialize>(value: &T, pretty: bool) -> serde_json::Result<String> {
+            if pretty { serde_json::to_string_pretty(value) } else { serde_json::to_string(value) }
+        }
         match mode {
-            SchemaMode::Full => serde_json::to_string(self),
-            SchemaMode::SnakemakeStrict => serde_json::to_string(&SnakemakeView::from(self)),
+            SchemaMode::Full => to_string(self, pretty),
+            SchemaMode::SnakemakeStrict => to_string(&SnakemakeView::from(self), pretty),
         }
     }
 
