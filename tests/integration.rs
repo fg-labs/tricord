@@ -82,6 +82,17 @@ fn json_output_round_trips_to_object() {
 }
 
 #[test]
+fn json_output_emits_no_trailing_newline() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("timing.json");
+    let result = run_bench(&out, "json", &[], &["sh", "-c", "true"]);
+    assert!(result.status.success());
+
+    let text = std::fs::read_to_string(&out).unwrap();
+    assert!(!text.ends_with('\n'), "unexpected trailing newline: {text:?}");
+}
+
+#[test]
 fn json_pretty_output_round_trips_to_object() {
     let tmp = tempfile::tempdir().unwrap();
     let out = tmp.path().join("timing.json");
@@ -95,6 +106,17 @@ fn json_pretty_output_round_trips_to_object() {
     assert!(value.is_object());
     assert!(value["running_time"].as_f64().expect("running_time number") >= 0.5);
     assert_eq!(value["data_collected"], true);
+}
+
+#[test]
+fn json_pretty_output_emits_trailing_newline() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("timing.json");
+    let result = run_bench(&out, "json-pretty", &[], &["sh", "-c", "true"]);
+    assert!(result.status.success());
+
+    let text = std::fs::read_to_string(&out).unwrap();
+    assert!(text.ends_with('\n'), "missing trailing newline: {text:?}");
 }
 
 #[test]

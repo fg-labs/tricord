@@ -15,7 +15,7 @@ pub enum OutputFormat {
     Tsv,
     /// Single JSON object, one line, no trailing newline.
     Json,
-    /// Single JSON object, pretty-printed.
+    /// Single JSON object, pretty-printed, with a trailing newline.
     JsonPretty,
 }
 
@@ -207,6 +207,14 @@ mod tests {
     }
 
     #[test]
+    fn json_writer_emits_no_trailing_newline() {
+        let mut buf = Vec::new();
+        write_to(&sample_record(), &mut buf, OutputFormat::Json, SchemaMode::Full).unwrap();
+        let text = std::str::from_utf8(&buf).unwrap();
+        assert!(!text.ends_with('\n'), "unexpected trailing newline: {text:?}");
+    }
+
+    #[test]
     fn json_pretty_writer_full_mode_includes_tricord_fields() {
         let mut buf = Vec::new();
         write_to(&sample_record(), &mut buf, OutputFormat::JsonPretty, SchemaMode::Full).unwrap();
@@ -230,6 +238,14 @@ mod tests {
         let obj = value.as_object().unwrap();
         assert!(!obj.contains_key("major_page_faults"));
         assert!(!obj.contains_key("minor_page_faults"));
+    }
+
+    #[test]
+    fn json_pretty_writer_emits_trailing_newline() {
+        let mut buf = Vec::new();
+        write_to(&sample_record(), &mut buf, OutputFormat::JsonPretty, SchemaMode::Full).unwrap();
+        let text = std::str::from_utf8(&buf).unwrap();
+        assert!(text.ends_with('\n'), "missing trailing newline: {text:?}");
     }
 
     #[test]
