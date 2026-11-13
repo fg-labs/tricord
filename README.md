@@ -98,6 +98,23 @@ The command to benchmark is everything after the `--` separator. No shell
 interpretation is done by `tricorder` itself; if you need shell features (pipes,
 quoting), invoke `bash -c '...'` explicitly.
 
+When used in a pipeline, `tricorder` releases its own copies of pipe-backed stdin
+and stdout after spawning the command. The command keeps the original streams:
+closing its stdout lets downstream readers see EOF immediately, and closing its
+stdin lets upstream writers detect a broken pipe, even while the command is still
+running. Stderr remains available for diagnostics and summaries. Other copies of
+the same pipe, such as stderr redirected with `2>&1`, can still keep it open.
+Use ordinary file paths for benchmark outputs. Pipe-backed `/dev/stdout`,
+`/dev/stdin`, and equivalent descriptor paths are rejected before the command starts.
+
+Library calls to `tricord::run_command` leave the caller's standard streams alone.
+Use `tricord::run_command_releasing_pipes` to opt into the CLI behavior. This
+permanently redirects the caller's pipe- or socket-backed stdin/stdout to
+`/dev/null`, affecting every thread and subsequent command in that process;
+regular files and terminals are unchanged. Rust's stdout buffer is flushed before
+redirection. Callers must flush any other buffering layers and stop concurrent
+access to these descriptors before opting in.
+
 ## Output
 
 ### TSV (default)
