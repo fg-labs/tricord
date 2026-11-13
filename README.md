@@ -134,7 +134,7 @@ s	h:m:s	max_rss	max_vms	max_uss	max_pss	io_in	io_out	mean_load	cpu_time	major_pa
 |---|---|---|
 | `s` | seconds (`%.4f`) | Wall-clock running time |
 | `h:m:s` | `H:MM:SS` | Same value, human-readable |
-| `max_rss` | MiB (`%.2f`) | Peak summed RSS across the process tree |
+| `max_rss` | MiB (`%.2f`) | Larger of the sampled simultaneous tree RSS peak and the exit-accounted per-process RSS high-water mark; not an exact tree peak |
 | `max_vms` | MiB | Peak summed virtual memory size |
 | `max_uss` | MiB | Peak summed unique set size |
 | `max_pss` | MiB | Peak summed proportional set size (Linux only — see below) |
@@ -151,11 +151,16 @@ s	h:m:s	max_rss	max_vms	max_uss	max_pss	io_in	io_out	mean_load	cpu_time	major_pa
 | `loadavg_1m_start` | float (`%.2f`) | System 1-minute load average sampled just before the child started. Frames the rest of the numbers — a peak `cpu_time` of 800% on an idle host (loadavg ~1) means something very different from the same peak on a thrashing host. `tricord`-added; omitted under `--snakemake`. |
 | `loadavg_1m_end` | float (`%.2f`) | System 1-minute load average sampled just after the child exited. Paired with `loadavg_1m_start` to show whether the run drove the host load up. `tricord`-added; omitted under `--snakemake`. |
 | `max_swap` | MiB | Peak summed swap usage across the process tree (max over sampling ticks of `VmSwap` summed across PIDs). `tricord`-added; omitted under `--snakemake`. Always `-` on macOS — the kernel has no public per-process swap-usage API. |
-| `page_cache_start` | MiB | System page-cache size (`Cached` in `/proc/meminfo`) sampled just before the child started. Frames the memory numbers the same way `loadavg_1m_start` frames CPU numbers: a run slowed by page-cache eviction from other work on the host looks identical to a real regression without it. `tricord`-added; omitted under `--snakemake`. On macOS renders `-` (no `Cached` equivalent) once a sample was taken, or `NA` like every other resource column if the run ended before the first sample — see [Platform notes](#platform-notes). |
-| `page_cache_end` | MiB | System page-cache size sampled just after the child exited. Paired with `page_cache_start` — a drop is a direct sign the run (or a neighbor) evicted cached pages. `tricord`-added; omitted under `--snakemake`. On macOS renders `-` once a sample was taken, or `NA` if the run ended before the first sample. |
+| `page_cache_start` | MiB | System page-cache size (`Cached` in `/proc/meminfo`) sampled just before the child started. Frames the memory numbers the same way `loadavg_1m_start` frames CPU numbers: a run slowed by page-cache eviction from other work on the host looks identical to a real regression without it. `tricord`-added; omitted under `--snakemake`. On macOS renders `-` (no `Cached` equivalent) — see [Platform notes](#platform-notes). |
+| `page_cache_end` | MiB | System page-cache size sampled just after the child exited. Paired with `page_cache_start` — a drop is a direct sign the run (or a neighbor) evicted cached pages. `tricord`-added; omitted under `--snakemake`. On macOS renders `-`. |
 
-Missing values render as `-`; if the run was too short for any sample to
-succeed, every resource column is `NA`.
+Missing values render as `-`. Even when a command exits before the first sampling tick, exit accounting supplies CPU time, mean load, and an RSS high-water mark; unsampled metrics remain `-` (JSON `null`), rather than zero. `data_collected` means either sampling or exit accounting succeeded. Records without either source retain the all-`NA` resource row.
+
+`BenchmarkRecord::peak_n_procs` is now `Option<u64>` in the Rust API: `None` means no sampling tick succeeded. Existing sampled records retain their numeric JSON value; exit-only records use `null`. TSV column order and formatting are unchanged, but short runs now report available exit metrics instead of an all-`NA` row.
+
+Wall time runs from just before spawning the child until its wait returns, excluding sampler shutdown. The sampler is woken on exit instead of waiting for the next interval.
+
+CPU time is the larger of the sampled per-PID cumulative total and `wait4`'s final user + system CPU total. These overlap and are never added. Exit accounting includes the direct child and descendants whose usage propagated through waits, recovering short-lived commands and the final unsampled CPU tail. It does not guarantee complete accounting for orphaned or unwaited descendants; taking the larger total can still miss work unique to each source. RSS similarly takes the larger of the sampled simultaneous tree peak and the exit-accounted per-process high-water mark, which is not an exact simultaneous tree peak. Other memory metrics and I/O remain sampled. Per-tick traces remain sampled and can end below the final aggregate CPU total.
 
 ### Per-tick trace (`--trace <PATH>`)
 
@@ -203,7 +208,7 @@ set see exactly what they would have seen from `snakemake.benchmark`:
 {"running_time":12.3456,"max_rss":101.5,"max_vms":2048.0,"max_uss":95.2,"max_pss":96.0,"io_in":1.25,"io_out":0.5,"mean_load":175.0,"cpu_time":21.6,"data_collected":true}
 ```
 
-Raw numeric types, `null` for fields that the platform did not expose.
+Raw numeric types, `null` for metrics with no observation: unsupported platform metrics, failed reads, or sampled metrics when no sampling tick succeeded.
 
 ### Markdown (`--export-markdown <PATH>`)
 
@@ -241,18 +246,19 @@ macOS implementation uses [`libproc`]'s `proc_pidinfo` and `proc_pid_rusage`
 
 | Metric | Linux | macOS |
 |---|---|---|
-| `max_rss`, `max_vms` | `/proc/<pid>/status` | `proc_taskinfo` |
+| `max_rss` | `/proc/<pid>/status`, reconciled with `wait4` (KiB converted to MiB) | `proc_taskinfo`, reconciled with `wait4` (bytes converted to MiB) |
+| `max_vms` | `/proc/<pid>/status` | `proc_taskinfo` |
 | `max_uss` | `/proc/<pid>/smaps_rollup` (Private_Clean + Private_Dirty) | `proc_pid_rusage::ri_phys_footprint` |
 | `max_pss` | `/proc/<pid>/smaps_rollup` (Pss) | mirrors `max_uss` (kernel does not compute PSS — see below) |
 | `io_in`, `io_out` | `/proc/<pid>/io` | `proc_pid_rusage::ri_diskio_*` |
-| `cpu_time` | `/proc/<pid>/stat` (utime + stime) | `proc_taskinfo::pti_total_user + pti_total_system` |
+| `cpu_time` | `/proc/<pid>/stat` (utime + stime), reconciled with `wait4` | `proc_taskinfo::pti_total_user + pti_total_system`, reconciled with `wait4` |
 | `major_page_faults` | `/proc/<pid>/stat` (majflt) | `proc_pid_rusage::ri_pageins` |
 | `minor_page_faults` | `/proc/<pid>/stat` (minflt) | not exposed — column is `-` |
 | `voluntary_ctx_switches`, `involuntary_ctx_switches` | `/proc/<pid>/status` (`voluntary_ctxt_switches`, `nonvoluntary_ctxt_switches`) | not split by `proc_pid_rusage` — both columns are `-` |
 | `peak_n_threads`, `n_threads` | `/proc/<pid>/status` (`threads`) | `proc_taskinfo::pti_threadnum` |
 | `loadavg_1m_start`, `loadavg_1m_end` | `/proc/loadavg` (first field) | `getloadavg(3)` |
 | `max_swap`, `swap` | `/proc/<pid>/status` (`VmSwap`) | not exposed — both columns are `-` |
-| `page_cache_start`, `page_cache_end` | `/proc/meminfo` (`Cached`) | not exposed — both columns are `-` once a sample was taken, or `NA` if the run ended before the first sample (matching every other resource column). macOS's VM system does not track file-backed page-cache pages as a separate, directly comparable quantity. |
+| `page_cache_start`, `page_cache_end` | `/proc/meminfo` (`Cached`) | not exposed — both columns are `-` when resource data was collected. macOS's VM system does not track file-backed page-cache pages as a separate, directly comparable quantity. |
 
 ### macOS PSS approximation
 
@@ -323,7 +329,7 @@ A few values are computed slightly more accurately than Snakemake's sampler:
   per PID and sums those at the end, so an exited child's I/O is still
   counted.
 - **`cpu_time`**: same correction — Snakemake takes the latest snapshot's
-  alive-process sum; `tricord` accumulates per-PID maxima.
+  alive-process sum; `tricord` accumulates per-PID maxima and takes the larger of that total and the child's exit-accounted CPU time.
 - **`mean_load`**: derived from the corrected `cpu_time`, so it doesn't
   inherit the first-poll-zero quirk from `psutil.cpu_percent()`.
 

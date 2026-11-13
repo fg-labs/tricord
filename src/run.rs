@@ -1,11 +1,14 @@
 //! End-to-end orchestration: spawn the child, run the sampler, write output.
 
+#[cfg(test)]
+mod eintr_tests;
+
 use std::{
     io::{self, IsTerminal},
     os::unix::process::{CommandExt, ExitStatusExt},
     path::Path,
-    process::{Command, ExitStatus, Stdio},
-    time::Duration,
+    process::{Child, Command, ExitStatus, Stdio},
+    time::{Duration, Instant},
 };
 
 use crate::{
@@ -19,7 +22,7 @@ use crate::{
 /// Outcome of a single `tricorder` invocation.
 #[derive(Debug)]
 pub struct RunOutcome {
-    /// Aggregated resource record produced by the sampler.
+    /// Aggregated resource record from sampling and child-exit accounting.
     pub record: BenchmarkRecord,
     /// Exit status of the spawned child.
     pub status: ExitStatus,
@@ -134,6 +137,7 @@ where
     cmd.stdout(Stdio::inherit());
     cmd.stderr(Stdio::inherit());
     cmd.process_group(0);
+    let started_at = Instant::now();
     let mut child = cmd.spawn()?;
 
     #[allow(clippy::cast_possible_wrap)]
@@ -161,8 +165,11 @@ where
         SamplerOptions { interval: options.interval, trace_path: options.trace_path.clone() },
     );
 
-    let status = child.wait()?;
-    let mut record = sampler.stop();
+    let waited = wait_with_usage(&mut child);
+    let running_time = started_at.elapsed();
+    let mut record = sampler.stop(running_time);
+    let (status, usage) = waited?;
+    usage.reconcile(&mut record);
     let loadavg_end = platform::read_loadavg_1m();
     let page_cache_end = platform::read_page_cache_mb();
     record.loadavg_1m_start = loadavg_start;
@@ -181,6 +188,74 @@ where
     }
 
     Ok(RunOutcome { record, status })
+}
+
+/// Exit accounting for the direct child and descendants whose usage propagated
+/// through waits. This overlaps with, but need not cover, the sampled tree.
+#[derive(Debug, Clone, Copy)]
+struct ExitUsage {
+    cpu_time: f64,
+    max_rss_mib: f64,
+}
+
+impl ExitUsage {
+    /// Use the larger overlapping total, never their sum. Neither source alone
+    /// necessarily includes every descendant (for example, orphaned workers).
+    fn reconcile(self, record: &mut BenchmarkRecord) {
+        record.cpu_time = record.cpu_time.max(self.cpu_time);
+        record.max_rss = Some(record.max_rss.unwrap_or(0.0).max(self.max_rss_mib));
+        record.mean_load = if record.running_time > 0.0 {
+            100.0 * record.cpu_time / record.running_time
+        } else {
+            0.0
+        };
+        record.data_collected = true;
+    }
+
+    // timeval field widths differ between Linux and macOS.
+    #[allow(clippy::cast_lossless)]
+    fn from_rusage(usage: &libc::rusage) -> Self {
+        let seconds = |time: libc::timeval| time.tv_sec as f64 + time.tv_usec as f64 / 1_000_000.0;
+        // Linux reports KiB, while macOS reports bytes. This is a per-process
+        // high-water mark, not a simultaneous sum over the process tree.
+        #[cfg(target_os = "linux")]
+        let rss_divisor = 1024.0;
+        #[cfg(target_os = "macos")]
+        let rss_divisor = 1024.0 * 1024.0;
+        Self {
+            cpu_time: seconds(usage.ru_utime) + seconds(usage.ru_stime),
+            max_rss_mib: usage.ru_maxrss as f64 / rss_divisor,
+        }
+    }
+}
+
+/// Reap only this child and obtain its final kernel counters. Process-wide
+/// `RUSAGE_CHILDREN` deltas would mix concurrent library callers' children.
+fn wait_with_usage(child: &mut Child) -> io::Result<(ExitStatus, ExitUsage)> {
+    // Match Child::wait's stdin closure so a piped child cannot wait forever
+    // for input held by its parent. No other code may reap this child.
+    drop(child.stdin.take());
+    let pid = child.id().cast_signed();
+    loop {
+        let mut status = 0;
+        let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+        // SAFETY: pid identifies our direct child; status and usage point to
+        // writable, correctly aligned storage. A successful wait4 initializes
+        // both outputs. Waiting for a specific PID cannot reap another child.
+        let result = unsafe { libc::wait4(pid, &raw mut status, 0, usage.as_mut_ptr()) };
+        if result == pid {
+            // SAFETY: wait4 succeeded and initialized the resource structure.
+            let usage = unsafe { usage.assume_init() };
+            // Child::drop does not reap; do not call Child::wait after this.
+            return Ok((ExitStatus::from_raw(status), ExitUsage::from_rusage(&usage)));
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+        #[cfg(test)]
+        eintr_tests::observed_interruption();
+    }
 }
 
 /// Reject any pair of output flags (`--out`, `--trace`, `--export-markdown`)
@@ -238,6 +313,85 @@ mod tests {
     use std::os::unix::process::ExitStatusExt;
 
     use super::*;
+
+    #[test]
+    fn exit_usage_reconciles_overlapping_counters_without_adding() {
+        for (sampled_cpu, exit_cpu, sampled_rss, exit_rss, cpu, rss) in
+            [(8.0, 10.0, 20.0, 16.0, 10.0, 20.0), (10.0, 8.0, 16.0, 20.0, 10.0, 20.0)]
+        {
+            let mut record = BenchmarkRecord {
+                running_time: 2.0,
+                cpu_time: sampled_cpu,
+                max_rss: Some(sampled_rss),
+                ..Default::default()
+            };
+            ExitUsage { cpu_time: exit_cpu, max_rss_mib: exit_rss }.reconcile(&mut record);
+            assert!((record.cpu_time - cpu).abs() < 1e-9);
+            assert!((record.mean_load - 500.0).abs() < 1e-9);
+            assert_eq!(record.max_rss, Some(rss));
+            assert!(record.data_collected);
+        }
+    }
+
+    #[test]
+    fn exit_only_record_preserves_unknown_metrics_in_all_formats() {
+        let mut record = BenchmarkRecord { running_time: 1.0, ..Default::default() };
+        ExitUsage { cpu_time: 0.25, max_rss_mib: 16.0 }.reconcile(&mut record);
+        let tsv = record.to_tsv_row(SchemaMode::Full);
+        let cols: Vec<_> = tsv.split('\t').collect();
+        assert_eq!(&cols[2..10], &["16.00", "-", "-", "-", "-", "-", "25.00", "0.25"]);
+        assert_eq!(cols[15], "-");
+        let json: serde_json::Value =
+            serde_json::from_str(&record.to_json(SchemaMode::Full).unwrap()).unwrap();
+        assert_eq!(json["data_collected"], true);
+        assert_eq!(json["cpu_time"], 0.25);
+        for key in ["max_vms", "max_uss", "io_in", "peak_n_procs"] {
+            assert_eq!(
+                json.get(key),
+                Some(&serde_json::Value::Null),
+                "{key} must be present and unknown"
+            );
+        }
+        let markdown = record.to_markdown_document(SchemaMode::Full);
+        for metric in ["max_vms", "peak_n_procs"] {
+            let value = markdown
+                .lines()
+                .find_map(|line| {
+                    let mut cells = line.split('|').map(str::trim);
+                    cells.next()?;
+                    (cells.next()? == metric).then(|| cells.next()).flatten()
+                })
+                .unwrap_or_else(|| panic!("missing Markdown row: {metric}"));
+            assert_eq!(value, "-", "{metric} must be unknown");
+        }
+    }
+
+    #[test]
+    fn zero_wall_time_does_not_produce_infinite_load() {
+        let mut record = BenchmarkRecord::default();
+        ExitUsage { cpu_time: 0.25, max_rss_mib: 16.0 }.reconcile(&mut record);
+        assert!(record.mean_load.abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn rusage_conversion_normalizes_units() {
+        // SAFETY: rusage contains only integer/timeval fields; all-zero is valid.
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        usage.ru_utime.tv_sec = 1;
+        usage.ru_utime.tv_usec = 250_000;
+        usage.ru_stime.tv_usec = 125_000;
+        #[cfg(target_os = "linux")]
+        {
+            usage.ru_maxrss = 16 * 1024;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            usage.ru_maxrss = 16 * 1024 * 1024;
+        }
+        let converted = ExitUsage::from_rusage(&usage);
+        assert!((converted.cpu_time - 1.375).abs() < 1e-9);
+        assert!((converted.max_rss_mib - 16.0).abs() < 1e-9);
+    }
 
     #[test]
     fn exit_code_normal_exit_passes_through() {
