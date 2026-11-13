@@ -128,7 +128,7 @@ mod tests {
             voluntary_ctx_switches: Some(40),
             involuntary_ctx_switches: Some(5),
             peak_n_threads: Some(6),
-            peak_n_procs: 2,
+            peak_n_procs: Some(2),
             loadavg_1m_start: Some(0.75),
             loadavg_1m_end: Some(1.10),
             max_swap: Some(0.25),

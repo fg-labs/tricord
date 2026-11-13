@@ -147,20 +147,21 @@ impl TickRecord {
     }
 }
 
-/// One row of benchmark output: the aggregate of all samples taken across the run.
+/// One row of benchmark output: sampled counters reconciled with exit accounting.
 ///
 /// Memory values are in MiB. `io_in` and `io_out` are in MiB. `running_time` and
 /// `cpu_time` are in seconds. `mean_load` is "percent of one CPU core" averaged
 /// over the wall-clock run (i.e. 100 = one core fully utilized; 200 = two).
 ///
-/// `Option`-valued fields are `None` when the underlying OS does not expose the
-/// metric for the platform (e.g. `io_in` on macOS prior to introspection, or
-/// `max_pss` on macOS where the kernel does not compute proportional set size).
+/// `Option`-valued fields are `None` when no observation is available: the OS
+/// does not expose the metric, a read failed, or no sampling tick succeeded.
+/// Exit-only records can therefore contain known CPU/RSS and unknown sampled metrics.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct BenchmarkRecord {
     /// Wall-clock running time in seconds.
     pub running_time: f64,
-    /// Peak resident set size, summed across the process tree, in MiB.
+    /// Larger of the sampled simultaneous tree RSS peak and the exit-accounted
+    /// per-process RSS high-water mark, in MiB. Not an exact tree peak.
     pub max_rss: Option<f64>,
     /// Peak virtual memory size, summed across the process tree, in MiB.
     pub max_vms: Option<f64>,
@@ -196,11 +197,9 @@ pub struct BenchmarkRecord {
     /// of the summed per-PID thread counts. `None` if no process ever
     /// exposed a thread count.
     pub peak_n_threads: Option<u64>,
-    /// Peak instantaneous live-process count across the tree — the max over
-    /// ticks of `snapshots.len()`. Always known when `data_collected` is
-    /// true; renders as `NA` otherwise (matching the existing scalar
-    /// fields like `cpu_time`).
-    pub peak_n_procs: u64,
+    /// Peak instantaneous live-process count across the tree: the max over
+    /// ticks of `snapshots.len()`. `None` when no sampling tick succeeded.
+    pub peak_n_procs: Option<u64>,
     /// System 1-minute load average sampled just before `tricord` started
     /// the child. `None` if the platform read failed.
     pub loadavg_1m_start: Option<f64>,
@@ -228,11 +227,10 @@ pub struct BenchmarkRecord {
     /// real regression without this — a drop from start to end is the
     /// signal.
     pub page_cache_end: Option<f64>,
-    /// Whether at least one sample successfully read OS resource counters.
+    /// Whether sampling or exit accounting successfully read resource counters.
     ///
-    /// When `false` the TSV row is rendered with `NA` placeholders for every
-    /// resource column, matching Snakemake's behavior for processes that exited
-    /// before the first poll.
+    /// When `false` the TSV row uses `NA` for every resource column. Exit-only
+    /// records expose CPU and RSS, with `-` for unsampled optional metrics.
     pub data_collected: bool,
 }
 
@@ -277,13 +275,11 @@ impl BenchmarkRecord {
                 self.voluntary_ctx_switches,
                 self.involuntary_ctx_switches,
                 self.peak_n_threads,
+                self.peak_n_procs,
             ] {
                 out.push('\t');
                 out.push_str(&format_optional_u64(value));
             }
-            // peak_n_procs is a plain `u64`, not Option, so render bare —
-            // when `data_collected` is true it's always populated.
-            write!(out, "\t{}", self.peak_n_procs).unwrap();
             for value in [
                 self.loadavg_1m_start,
                 self.loadavg_1m_end,
@@ -401,10 +397,7 @@ impl BenchmarkRecord {
             rows.push(("voluntary_ctx_switches", int_cell(self.voluntary_ctx_switches)));
             rows.push(("involuntary_ctx_switches", int_cell(self.involuntary_ctx_switches)));
             rows.push(("peak_n_threads", int_cell(self.peak_n_threads)));
-            rows.push((
-                "peak_n_procs",
-                if self.data_collected { self.peak_n_procs.to_string() } else { "NA".to_string() },
-            ));
+            rows.push(("peak_n_procs", int_cell(self.peak_n_procs)));
             rows.push(("loadavg_1m_start", cell(self.loadavg_1m_start)));
             rows.push(("loadavg_1m_end", cell(self.loadavg_1m_end)));
             rows.push(("max_swap", cell(self.max_swap)));
@@ -527,7 +520,7 @@ mod tests {
             voluntary_ctx_switches: Some(80),
             involuntary_ctx_switches: Some(7),
             peak_n_threads: Some(13),
-            peak_n_procs: 4,
+            peak_n_procs: Some(4),
             loadavg_1m_start: Some(0.50),
             loadavg_1m_end: Some(2.25),
             max_swap: Some(64.00),
@@ -643,8 +636,8 @@ mod tests {
 
     #[test]
     fn tsv_row_full_mode_renders_missing_tricord_metrics_as_dash() {
-        // Option-typed tricord metrics render as `-` when None; the plain
-        // `peak_n_procs: u64` renders as its bare integer (full_record's 4).
+        // Option-typed tricord metrics render as `-` when None.
+        // Known process counts render as bare integers (full_record's 4).
         // Loadavg, max_swap, and page_cache fields are Option<f64>, also
         // render as `-`.
         let record = BenchmarkRecord {
@@ -858,7 +851,7 @@ mod tests {
             voluntary_ctx_switches: None,
             involuntary_ctx_switches: None,
             peak_n_threads: None,
-            peak_n_procs: 1,
+            peak_n_procs: Some(1),
             loadavg_1m_start: None,
             loadavg_1m_end: None,
             max_swap: None,
@@ -911,10 +904,10 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["running_time"], 1.5);
         assert_eq!(v["max_rss"], 42.0);
-        assert!(v["max_pss"].is_null());
+        assert_eq!(v.get("max_pss"), Some(&serde_json::Value::Null));
         assert_eq!(v["data_collected"], true);
         assert_eq!(v["major_page_faults"], 7);
-        assert!(v["minor_page_faults"].is_null());
+        assert_eq!(v.get("minor_page_faults"), Some(&serde_json::Value::Null));
     }
 
     #[test]

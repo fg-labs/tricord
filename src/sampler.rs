@@ -18,10 +18,7 @@ use std::{
     fs::File,
     io::{BufWriter, Write},
     path::Path,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::mpsc::{self, Receiver, RecvTimeoutError, Sender},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -473,7 +470,7 @@ impl SamplerState {
             voluntary_ctx_switches: cum.voluntary_ctx_switches,
             involuntary_ctx_switches: cum.involuntary_ctx_switches,
             peak_n_threads: self.max_n_threads,
-            peak_n_procs: self.max_n_procs,
+            peak_n_procs: Some(self.max_n_procs),
             // Loadavg and page-cache start/end are captured by run_command
             // around the sampler's lifetime, not inside the sampler itself.
             loadavg_1m_start: None,
@@ -505,9 +502,8 @@ impl Default for SamplerOptions {
 
 /// Handle to a running sampler thread.
 pub struct SamplerHandle {
-    stop: Arc<AtomicBool>,
+    stop: Sender<()>,
     thread: Option<JoinHandle<SamplerState>>,
-    started_at: Instant,
 }
 
 impl SamplerHandle {
@@ -519,8 +515,7 @@ impl SamplerHandle {
     /// exhaustion). Callers are expected to terminate in that case.
     #[must_use]
     pub fn spawn(root_pid: i32, options: SamplerOptions) -> Self {
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop_for_thread = Arc::clone(&stop);
+        let (stop, stop_for_thread) = mpsc::channel();
         let started_at = Instant::now();
         let thread = thread::Builder::new()
             .name("tricord-sampler".into())
@@ -534,24 +529,23 @@ impl SamplerHandle {
                 )
             })
             .expect("failed to spawn sampler thread");
-        Self { stop, thread: Some(thread), started_at }
+        Self { stop, thread: Some(thread) }
     }
 
     /// Signal the sampler thread to stop and wait for it to finish.
     ///
-    /// Returns the aggregated [`BenchmarkRecord`] including the final wall-clock
-    /// running time computed from when [`Self::spawn`] was called.
+    /// Returns the aggregated [`BenchmarkRecord`] using the caller-supplied
+    /// wall-clock `running_time`, excluding time spent joining the sampler.
     ///
     /// # Panics
     /// Panics if called twice on the same handle, which the type system already
     /// prevents (the method takes `self` by value).
     #[must_use]
-    pub fn stop(mut self) -> BenchmarkRecord {
-        self.stop.store(true, Ordering::SeqCst);
+    pub fn stop(mut self, running_time: Duration) -> BenchmarkRecord {
+        let _ = self.stop.send(());
         let state =
             self.thread.take().expect("sampler thread already joined").join().unwrap_or_default();
-        let elapsed = self.started_at.elapsed().as_secs_f64();
-        state.into_record(elapsed)
+        state.into_record(running_time.as_secs_f64())
     }
 }
 
@@ -560,18 +554,14 @@ fn run_sampler_loop(
     interval: Duration,
     trace_path: Option<&Path>,
     started_at: Instant,
-    stop: &AtomicBool,
+    stop: &Receiver<()>,
 ) -> SamplerState {
     let mut state = SamplerState::default();
     let mut sampler = platform::new_sampler();
     let mut trace = trace_path.and_then(open_trace_writer);
-    while !stop.load(Ordering::SeqCst) {
-        thread::sleep(interval);
-        if stop.load(Ordering::SeqCst) {
-            // Skip the sample if we were asked to stop while sleeping; the
-            // child has already exited and re-reading /proc may race.
-            break;
-        }
+    // Stop requests and disconnection skip the final sample; the child has
+    // already exited and re-reading /proc may race.
+    while let Err(RecvTimeoutError::Timeout) = stop.recv_timeout(interval) {
         let snapshots = sampler.sample_tree(root_pid);
         state.absorb(&snapshots);
         if let Some(writer) = trace.as_mut()
@@ -626,6 +616,7 @@ mod tests {
         assert!(!record.data_collected);
         assert!((record.running_time - 1.0).abs() < 1e-9);
         assert!(record.max_rss.is_none());
+        assert_eq!(record.peak_n_procs, None);
     }
 
     #[test]
@@ -650,6 +641,7 @@ mod tests {
         assert_eq!(record.max_pss, Some(9.0));
         assert_eq!(record.io_in, Some(1.0));
         assert_eq!(record.io_out, Some(2.0));
+        assert_eq!(record.peak_n_procs, Some(1));
         assert!((record.cpu_time - 0.5).abs() < 1e-9);
         assert!((record.mean_load - 25.0).abs() < 1e-9); // 0.5s cpu / 2.0s wall = 25%.
         // Page faults default to None when the platform never reported them.
@@ -687,6 +679,7 @@ mod tests {
         }]);
         let record = state.into_record(1.0);
         assert_eq!(record.max_rss, Some(30.0)); // peak across snapshots
+        assert_eq!(record.peak_n_procs, Some(2));
     }
 
     #[test]
@@ -810,6 +803,49 @@ mod tests {
     }
 
     #[test]
+    fn sampler_stop_interrupts_long_interval_and_uses_supplied_running_time() {
+        #[allow(clippy::cast_possible_wrap)]
+        let pid = std::process::id() as i32;
+        let handle = SamplerHandle::spawn(
+            pid,
+            SamplerOptions { interval: Duration::from_secs(30), trace_path: None },
+        );
+        // Give the sampler time to enter its wait without doing any sampling.
+        thread::sleep(Duration::from_millis(50));
+        let stopped_at = Instant::now();
+        let running_time = Duration::from_millis(1234);
+        let record = handle.stop(running_time);
+
+        assert!(stopped_at.elapsed() < Duration::from_secs(1), "stop waited for the interval");
+        assert!((record.running_time - running_time.as_secs_f64()).abs() < 1e-9);
+        assert!(!record.data_collected, "stopping must not trigger a final sample");
+    }
+
+    #[test]
+    fn sampler_skips_sampling_when_stop_is_already_requested() {
+        #[allow(clippy::cast_possible_wrap)]
+        let pid = std::process::id() as i32;
+        let (stop, receiver) = mpsc::channel();
+        stop.send(()).unwrap();
+
+        let state = run_sampler_loop(pid, Duration::ZERO, None, Instant::now(), &receiver);
+
+        assert!(!state.data_collected);
+    }
+
+    #[test]
+    fn sampler_exits_without_sampling_when_stop_channel_disconnects() {
+        #[allow(clippy::cast_possible_wrap)]
+        let pid = std::process::id() as i32;
+        let (stop, receiver) = mpsc::channel::<()>();
+        drop(stop);
+
+        let state = run_sampler_loop(pid, Duration::ZERO, None, Instant::now(), &receiver);
+
+        assert!(!state.data_collected);
+    }
+
+    #[test]
     fn sampler_thread_writes_trace_file_when_path_set() {
         let tmp = tempfile::tempdir().unwrap();
         let trace = tmp.path().join("trace.tsv");
@@ -826,7 +862,7 @@ mod tests {
         );
         // Let several ticks fire.
         thread::sleep(Duration::from_millis(300));
-        let _ = handle.stop();
+        let _ = handle.stop(Duration::from_millis(300));
 
         let text = std::fs::read_to_string(&trace).expect("trace file");
         let lines: Vec<&str> = text.lines().collect();
