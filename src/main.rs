@@ -6,7 +6,7 @@ use clap::Parser;
 use tricord::{
     SchemaMode,
     cli::Args,
-    run::{RunOptions, run_command},
+    run::{RunOptions, run_command_releasing_pipes},
 };
 
 fn main() -> ExitCode {
@@ -31,7 +31,7 @@ fn main() -> ExitCode {
         schema_mode: if args.snakemake { SchemaMode::SnakemakeStrict } else { SchemaMode::Full },
     };
 
-    match run_command(&command, &command_args, &options) {
+    match run_command_releasing_pipes(&command, &command_args, &options) {
         Ok(outcome) => clamp_exit_code(outcome.exit_code()),
         Err(err) => {
             eprintln!("tricorder: error: {err}");

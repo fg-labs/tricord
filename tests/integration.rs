@@ -1,15 +1,14 @@
 //! End-to-end tests: spawn the `tricorder` binary against simple shell
 //! commands and verify the output file's shape, columns, and exit code.
 
-use std::{path::PathBuf, process::Command};
+use std::{
+    io::{Read, Write},
+    path::PathBuf,
+    process::{Command, Stdio},
+};
 
 fn binary() -> PathBuf {
-    let mut path = std::env::current_exe().expect("current_exe");
-    path.pop(); // drop test binary name
-    if path.ends_with("deps") {
-        path.pop();
-    }
-    path.join("tricorder")
+    PathBuf::from(env!("CARGO_BIN_EXE_tricorder"))
 }
 
 fn run_bench(
@@ -36,6 +35,191 @@ fn run_bench(
         cmd.arg(piece);
     }
     cmd.output().expect("spawn tricorder")
+}
+
+#[test]
+fn pipeline_descriptor_outputs_are_rejected_before_spawning() {
+    let tmp = tempfile::tempdir().unwrap();
+    let alias = tmp.path().join("stdout-link");
+    std::os::unix::fs::symlink("/dev/fd/1", &alias).unwrap();
+    for path in [
+        std::path::Path::new("/dev/stdout"),
+        std::path::Path::new("/dev/fd/1"),
+        std::path::Path::new("/dev/stdin"),
+        alias.as_path(),
+    ] {
+        for flag in ["--out", "--trace", "--export-markdown"] {
+            let out = tmp.path().join("timing.tsv");
+            let marker = tmp.path().join("spawned");
+            let mut command = Command::new(binary());
+            if flag != "--out" {
+                command.arg("--out").arg(&out);
+            }
+            let result = command
+                .arg(flag)
+                .arg(path)
+                .args(["--", "sh", "-c", ": > \"$1\"", "sh"])
+                .arg(&marker)
+                .stdin(Stdio::piped())
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            assert_eq!(result.status.code(), Some(127), "{flag} {}: {stderr}", path.display());
+            assert!(stderr.contains(flag), "stderr: {stderr}");
+            assert!(stderr.contains("use a separate output file"), "stderr: {stderr}");
+            assert!(!marker.exists(), "must reject {flag} before spawning");
+            assert!(!out.exists());
+        }
+    }
+}
+
+/// Configure an interactive wrapper without waiting for its child to exit.
+fn pipeline_command(out: &std::path::Path) -> Command {
+    let mut command = Command::new(binary());
+    command.arg("--out").arg(out);
+    command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    command
+}
+
+#[test]
+fn pipeline_preserves_child_stdio_and_summary() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("timing.tsv");
+    let mut wrapper = pipeline_command(&out)
+        .args([
+            "--summary",
+            "--",
+            "sh",
+            "-c",
+            "read -r line; printf '%s\\n' \"$line\"; printf 'child diagnostic\\n' >&2",
+        ])
+        .spawn()
+        .expect("spawn tricorder");
+    writeln!(wrapper.stdin.take().unwrap(), "input payload").expect("write child input");
+    let result = wrapper.wait_with_output().expect("wait for tricorder");
+
+    assert!(result.status.success());
+    assert_eq!(result.stdout, b"input payload\n");
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(stderr.contains("child diagnostic\n"), "stderr: {stderr}");
+    assert!(stderr.contains("tricorder:"), "stderr: {stderr}");
+    assert!(out.exists());
+}
+
+/// EOF must depend on the measured command, not on tricorder exiting.
+#[test]
+fn pipeline_stdout_closes_before_child_exits() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("timing.tsv");
+    let mut wrapper = pipeline_command(&out)
+        .args([
+            "--interval",
+            "0.01",
+            "--",
+            "sh",
+            "-c",
+            "printf 'payload\\n'; exec 1>&-; read -r release; exit 23",
+        ])
+        .spawn()
+        .expect("spawn tricorder");
+    let mut input = wrapper.stdin.take().unwrap();
+    let mut output = wrapper.stdout.take().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        let result = output.read_to_string(&mut text).map(|_| text);
+        sender.send(result).unwrap();
+    });
+
+    // Keep the child alive until after checking EOF. Always release and reap it,
+    // even if the assertion will fail, so a regression cannot hang the suite.
+    let early_output = receiver.recv_timeout(std::time::Duration::from_secs(5));
+    let still_running = wrapper.try_wait().expect("check tricorder").is_none();
+    writeln!(input, "release").expect("release child");
+    drop(input);
+    let result = wrapper.wait_with_output().expect("wait for tricorder");
+    reader.join().unwrap();
+
+    assert!(still_running, "child must still be running when stdout reaches EOF");
+    assert_eq!(
+        early_output.expect("stdout should reach EOF before child exits").unwrap(),
+        "payload\n"
+    );
+    assert_eq!(result.status.code(), Some(23));
+    assert!(out.exists(), "benchmark must still be written after the child exits");
+}
+
+/// Release the handshake and reap the wrapper even if a pipe assertion fails.
+struct WaitingPipeline {
+    child: std::process::Child,
+    release: PathBuf,
+}
+
+impl Drop for WaitingPipeline {
+    fn drop(&mut self) {
+        let _ = std::fs::write(&self.release, b"");
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// An upstream writer must see a broken pipe when the command closes stdin.
+#[test]
+fn pipeline_stdin_closes_before_child_exits() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("timing.tsv");
+    let release = tmp.path().join("release");
+    let ready_path = tmp.path().join("ready");
+    let wrapper = pipeline_command(&out)
+        .args([
+            "--interval",
+            "0.01",
+            "--",
+            "sh",
+            "-c",
+            concat!(
+                "exec 0<&-; : > \"$2\"; ",
+                "i=0; while [ ! -e \"$1\" ] && [ \"$i\" -lt 1500 ]; do ",
+                "sleep 0.01; i=$((i + 1)); done; test -e \"$1\""
+            ),
+            "sh",
+        ])
+        .arg(&release)
+        .arg(&ready_path)
+        .spawn()
+        .expect("spawn tricorder");
+    let mut pipeline = WaitingPipeline { child: wrapper, release };
+    let mut input = pipeline.child.stdin.take().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !ready_path.exists() {
+        assert!(std::time::Instant::now() < deadline, "child did not close stdin");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    // The child can run before tricorder releases its descriptors. Retry a
+    // bounded number of one-byte writes, staying well below pipe capacity.
+    let mut broken_pipe = false;
+    for _ in 0..500 {
+        match input.write_all(b"x") {
+            Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => {
+                broken_pipe = true;
+                break;
+            }
+            Ok(()) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            Err(err) => panic!("unexpected pipe write error: {err}"),
+        }
+    }
+    let still_running = pipeline.child.try_wait().expect("check tricorder").is_none();
+    std::fs::write(&pipeline.release, b"").expect("release child");
+    drop(input);
+    let status = pipeline.child.wait().expect("wait for tricorder");
+    let mut stderr = String::new();
+    pipeline.child.stderr.take().unwrap().read_to_string(&mut stderr).unwrap();
+
+    assert!(still_running, "child must still be running when stdin closes");
+    assert!(broken_pipe, "upstream must see a broken pipe before child exits");
+    assert!(status.success(), "stderr: {stderr}");
+    assert!(out.exists());
 }
 
 #[test]

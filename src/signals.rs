@@ -60,7 +60,7 @@ impl Drop for SignalForwarder {
 ///
 /// Errors are ignored — by the time we forward, the child may have already
 /// exited and there's nothing useful to do with `ESRCH`.
-fn forward_to_group(pgid: i32, sig: i32) {
+pub(crate) fn forward_to_group(pgid: i32, sig: i32) {
     // SAFETY: `kill(2)` is a thin syscall wrapper that takes plain integer
     // arguments and returns an integer; passing `-pgid` addresses the whole
     // process group per POSIX. Both arguments are fully owned by the caller.

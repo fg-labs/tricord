@@ -53,7 +53,8 @@ pub mod run;
 pub(crate) mod platform;
 pub(crate) mod sampler;
 pub(crate) mod signals;
+mod stdio;
 
 pub use format::OutputFormat;
 pub use record::{BenchmarkRecord, SchemaMode, TSV_HEADER, TSV_HEADER_FULL, tsv_header};
-pub use run::{RunOptions, RunOutcome, run_command};
+pub use run::{RunOptions, RunOutcome, run_command, run_command_releasing_pipes};
