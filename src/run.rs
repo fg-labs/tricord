@@ -104,8 +104,11 @@ pub fn run_command_releasing_pipes(
     args: &[String],
     options: &RunOptions,
 ) -> io::Result<RunOutcome> {
-    crate::stdio::validate_output_paths(options)?;
-    run_command_with_post_spawn(command, args, options, crate::stdio::release_pipes)
+    // Classify inherited streams before spawning or installing signal handlers:
+    // those allocate descriptors that may reuse a closed standard fd's number.
+    let plan = crate::stdio::ReleasePlan::capture()?;
+    crate::stdio::validate_output_paths(options, plan)?;
+    run_command_with_post_spawn(command, args, options, move || crate::stdio::release_pipes(plan))
 }
 
 /// Shared orchestration; the hook only runs after a successful spawn.
